@@ -21,8 +21,6 @@ pub struct DefSpecificationMap {
     pub prusti_assertions: FxHashMap<DefId, PrustiAssertion>,
     pub prusti_assumptions: FxHashMap<DefId, PrustiAssumption>,
     pub prusti_refutations: FxHashMap<DefId, PrustiRefutation>,
-    pub ghost_begin: FxHashMap<DefId, GhostBegin>,
-    pub ghost_end: FxHashMap<DefId, GhostEnd>,
 }
 
 impl DefSpecificationMap {
@@ -52,14 +50,6 @@ impl DefSpecificationMap {
 
     pub fn get_refutation(&self, def_id: &DefId) -> Option<&PrustiRefutation> {
         self.prusti_refutations.get(def_id)
-    }
-
-    pub fn get_ghost_begin(&self, def_id: &DefId) -> Option<&GhostBegin> {
-        self.ghost_begin.get(def_id)
-    }
-
-    pub fn get_ghost_end(&self, def_id: &DefId) -> Option<&GhostEnd> {
-        self.ghost_end.get(def_id)
     }
 
     pub(crate) fn defid_for_export(
@@ -92,9 +82,11 @@ impl DefSpecificationMap {
                     specs.extend(pledges.iter().filter_map(|pledge| pledge.lhs));
                     specs.extend(pledges.iter().map(|pledge| pledge.rhs));
                 }
-                let is_trusted = spec.trusted.extract_inherit().expect("Expected trusted")
-                // It has to be non-extern_spec which is trusted (since extern_specs are always trusted)
-                    && (*def_id == spec.source || !def_id.is_local());
+                // Trusted functions are opaque and need no body; `extern_spec`
+                // targets are trusted in the same way (their `#[trusted]` is
+                // mandatory). Every other pure function needs its MIR loaded
+                // for pure encoding and cross-crate export.
+                let is_trusted = spec.trusted.extract_inherit().expect("Expected trusted");
                 if spec.kind.is_pure().expect("Expected pure") && !is_trusted {
                     pure_fns.push(*def_id)
                 }
@@ -236,6 +228,25 @@ impl ProcedureSpecification {
             purity: SpecificationItem::Inherent(None),
         }
     }
+
+    /// Like [Self::empty], but with every item `Empty` so that refinement
+    /// against a trait spec inherits it wholesale. Used for a trait impl that
+    /// does not carry `#[refine_trait_spec]`: it has no annotations of its own
+    /// (enforced during collection), so unlike [Self::empty] its defaults must
+    /// not override the trait spec (e.g. with an impure kind).
+    pub fn empty_inheriting(source: DefId) -> Self {
+        ProcedureSpecification {
+            source,
+            extern_spec: None,
+            kind: SpecificationItem::Empty,
+            pres: SpecificationItem::Empty,
+            posts: SpecificationItem::Empty,
+            pledges: SpecificationItem::Empty,
+            trusted: SpecificationItem::Empty,
+            terminates: SpecificationItem::Empty,
+            purity: SpecificationItem::Empty,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable)]
@@ -311,16 +322,6 @@ pub struct PrustiAssumption {
 #[derive(Debug, Clone)]
 pub struct PrustiRefutation {
     pub refutation: LocalDefId,
-}
-
-#[derive(Debug, Clone)]
-pub struct GhostBegin {
-    pub marker: LocalDefId,
-}
-
-#[derive(Debug, Clone)]
-pub struct GhostEnd {
-    pub marker: LocalDefId,
 }
 
 /// The base container to store a contract of a procedure.
@@ -584,6 +585,16 @@ impl<T> SpecificationItem<T> {
         matches!(self, SpecificationItem::Empty)
     }
 
+    /// Applies `f` to each contained value, keeping the variant.
+    pub fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> SpecificationItem<U> {
+        match self {
+            SpecificationItem::Empty => SpecificationItem::Empty,
+            SpecificationItem::Inherent(val) => SpecificationItem::Inherent(f(val)),
+            SpecificationItem::Inherited(val) => SpecificationItem::Inherited(f(val)),
+            SpecificationItem::Refined(from, to) => SpecificationItem::Refined(f(from), f(to)),
+        }
+    }
+
     /// Returns the contained value of this item
     fn get(&self) -> Option<(Option<&T>, &T)> {
         // TODO(tymap): this API is not good: it must be possible to tell that
@@ -798,13 +809,24 @@ impl Refinable for ProcedureSpecification {
         }
         ProcedureSpecification {
             source: self.source,
-            // TODO: what here?
+            // Record the extern spec backing this spec's derivation, preferring
+            // our own. It must be inherited from the trait: spec items inherited
+            // from an `extern_spec` trait are closures inside the generated stub
+            // and need the extern-spec kind to encode, and foreign impls of such
+            // traits are trusted based on it (see `spec_is_trusted`). It does
+            // NOT mean the function itself is an extern-spec target.
             extern_spec: self.extern_spec.or(other.extern_spec),
             pres: self.pres.refine(replace_empty(&EMPTYL, &other.pres)),
             posts: self.posts.refine(replace_empty(&EMPTYL, &other.posts)),
             pledges: self.pledges.refine(replace_empty(&EMPTYP, &other.pledges)),
             kind: self.kind.refine(&other.kind),
-            trusted: self.trusted.refine(&other.trusted),
+            // `trusted` is deliberately not inherited: it only applies to the
+            // item it is written on. An impl is verified against the inherited
+            // contract unless the impl itself is marked `#[trusted]`, wherever
+            // that impl is verified. The one exception is an impl that cannot
+            // be annotated at all -- a foreign impl of an `extern_spec` trait
+            // -- which `spec_is_trusted` keeps opaque via `extern_spec`.
+            trusted: self.trusted,
             terminates: self.terminates.refine(&other.terminates),
             purity: self.purity.refine(&other.purity),
         }

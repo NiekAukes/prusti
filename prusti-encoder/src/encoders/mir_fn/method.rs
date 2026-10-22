@@ -1,17 +1,19 @@
-use pcg::{borrow_checker::r#impl::NllBorrowCheckerImpl, borrow_pcg::FunctionData};
+use pcg::borrow_pcg::FunctionData;
+use prusti_interface::PrustiError;
 use prusti_rustc_interface::{middle::mir, span::def_id::DefId};
-use task_encoder::{EncodeFullResult, OutputRefAny, TaskEncoder, TaskEncoderDependencies};
+use task_encoder::{
+    EncodeFullError, EncodeFullResult, OutputRefAny, TaskEncoder, TaskEncoderDependencies,
+};
 use vir::MethodIdn;
 
-use crate::{
-    encoders::{
-        Impure, ImpureEncVisitor, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc, WandEnc,
-        WandEncTask,
-        mir_fn::{CallTaskDescription, RustSignature},
-        pure::spec::MirSpecEncMode,
-        ty::generics::{GArgCaster, GArgsCastEnc, GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc},
+use crate::encoders::{
+    Impure, ImpureEncVisitor, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc, WandEnc, WandEncTask,
+    mir_fn::{CallTaskDescription, RustSignature, SpecBlocks, SpecBlocksEnc},
+    pure::spec::MirSpecEncMode,
+    ty::generics::{
+        GArgCaster, GArgsCastEnc, GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc,
+        trait_impls::TraitImplEnc,
     },
-    trait_support::is_function_with_body,
 };
 
 // Method wrapper
@@ -39,8 +41,8 @@ impl<'vir> MethodCallEncOutput<'vir> {
             .collect();
 
         args.insert(0, ret);
-        let call = (self.method.method_ref)(&args, self.ty_args.get_ty(), self.ty_args.get_const());
-        let call = vir::with_vcx(|vcx| vcx.alloc(vir::StmtGenData::new(vcx.alloc(call))));
+        let call = (self.method.method_ref)(&args, self.ty_args.get_ty(), self.ty_args.get_const())
+            .alloc();
         stmts.push(call);
 
         let result = self.output.cast_to_caller_ctx(ret);
@@ -122,7 +124,10 @@ pub(super) struct MethodEncOutput<'vir> {
 }
 
 #[derive(Clone, Debug)]
-pub enum MethodEncError {}
+pub enum MethodEncError {
+    /// The method cannot be encoded; this was reported as an early error.
+    Reported,
+}
 
 impl TaskEncoder for MethodEnc {
     task_encoder::encoder_cache!(MethodEnc);
@@ -138,6 +143,10 @@ impl TaskEncoder for MethodEnc {
         *task
     }
 
+    fn error_reported(error: &Self::EncodingError) -> bool {
+        matches!(error, MethodEncError::Reported)
+    }
+
     fn do_encode_full<'vir>(
         task_key: &Self::TaskKey<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
@@ -145,7 +154,6 @@ impl TaskEncoder for MethodEnc {
         let def_id = *task_key;
         vir::with_vcx(|vcx| {
             let span = vcx.tcx().def_span(def_id);
-            let trusted = crate::encoders::is_function_trusted(def_id);
 
             let arg_defs = deps.require_ref_spanned::<MirLocalDefEnc>(
                 MirLocalDefEncTask::Local {
@@ -171,7 +179,7 @@ impl TaskEncoder for MethodEnc {
             // Create the identifier and use it as an output ref. This is what
             // is used when other methods call this one.
             let method_name =
-                vir::vir_format_identifier!(vcx, "m_{}", vcx.tcx().def_path_str(def_id));
+                vir::vir_format_identifier!(vcx, "m_{}", vir::ViperIdent::from_def_id(vcx, def_id));
             let ref_args = vcx.alloc_slice(&vec![vir::TYPE_REF; arg_count]);
             let params = GParams::from(def_id);
             let generics = deps.require_dep_spanned::<GenericParamsEnc>(params, span)?;
@@ -199,12 +207,25 @@ impl TaskEncoder for MethodEnc {
                 span,
             )?;
             let function_data = FunctionData::new(def_id);
-            let wands = deps.require_dep_spanned::<WandEnc>(
-                WandEncTask {
-                    data: function_data,
-                },
-                span,
-            )?;
+            let wands = deps
+                .require_dep_spanned::<WandEnc>(
+                    WandEncTask {
+                        data: function_data,
+                    },
+                    span,
+                )
+                .map_err(|err| {
+                    // Without its wands, the method has no contract.
+                    let (message, _) = super::dep_error(&err);
+                    vcx.emit_early_error(PrustiError::unsupported(
+                        format!(
+                            "cannot encode method `{}`: {message}",
+                            vcx.tcx().def_path_str(def_id),
+                        ),
+                        vcx.tcx().def_span(def_id).into(),
+                    ));
+                    EncodeFullError::EncodingError(MethodEncError::Reported, None)
+                })?;
 
             // Add direct resources for inputs and outputs to the pre- and
             // postconditions, respectively. "Direct" here refers to owned
@@ -225,25 +246,24 @@ impl TaskEncoder for MethodEnc {
             posts.extend(wands.indirect_posts(vcx, &arg_defs, deps));
             posts.extend(wands.wand_posts(vcx, &arg_defs, deps));
 
-            // Do not encode the method body if it is external, trusted, just
-            // a call stub, or a trait function without a default implementation
-            let local_def_id = def_id
-                .as_local()
-                .filter(|_| !trusted && is_function_with_body(vcx.tcx(), def_id));
-            let blocks = if let Some(local_def_id) = local_def_id {
-                let body_with_facts = vcx.body_mut().get_impure_fn_body_with_facts(local_def_id);
+            // Trusted functions, call stubs, external functions and trait
+            // functions without a default implementation have no body to
+            // encode; only their contract is emitted.
+            let blocks = if let Some(body_with_facts) =
+                crate::encoders::impure_body_with_facts(def_id)
+            {
                 let body = &body_with_facts.body;
                 let local_defs = deps.require_dep_spanned::<MirLocalDefEnc>(
                     MirLocalDefEncTask::Local {
-                        def_id: local_def_id.to_def_id(),
+                        def_id,
                         all_locals: true,
                     },
                     span,
                 )?;
 
-                let bc = NllBorrowCheckerImpl::new(vcx.tcx(), &body_with_facts);
-                let pcg_ctxt = pcg::PcgCtxt::new(&body_with_facts.body, vcx.tcx(), &bc);
-                let fpcs_analysis = pcg::run_pcg(&pcg_ctxt);
+                let pcg_creator = pcg::PcgCtxtCreator::new(vcx.tcx());
+                let pcg_ctxt = pcg_creator.new_nll_ctxt(&body_with_facts);
+                let fpcs_analysis = pcg::run_pcg(pcg_ctxt);
                 pcg_ctxt.update_debug_visualization_metadata();
 
                 let block_count = body.basic_blocks.len();
@@ -258,7 +278,11 @@ impl TaskEncoder for MethodEnc {
                     vcx.mk_local_decl_stmt(vir::vir_local_decl! { vcx; [name_p] : Ref }, None),
                 );
                 for local in (arg_count..body.local_decls.len()).map(mir::Local::from) {
-                    let name_p = local_defs[local].local.name;
+                    // Spec-only locals have no definition.
+                    let Some(local_def) = local_defs.get(local) else {
+                        continue;
+                    };
+                    let name_p = local_def.local.name;
                     start_stmts.push(
                         vcx.mk_local_decl_stmt(vir::vir_local_decl! { vcx; [name_p] : Ref }, None),
                     )
@@ -271,6 +295,12 @@ impl TaskEncoder for MethodEnc {
                     vcx.mk_goto_stmt(&vir::CfgBlockLabelData::BasicBlock(0)),
                 ));
 
+                let spec_blocks = SpecBlocks::new(
+                    deps.require_dep::<SpecBlocksEnc>(def_id)?,
+                    body,
+                    fpcs_analysis.analysis().loop_analysis(),
+                );
+
                 deps.check_cycle()?;
                 let mut visitor = ImpureEncVisitor {
                     vcx,
@@ -279,6 +309,7 @@ impl TaskEncoder for MethodEnc {
                     local_decls: &body.local_decls,
                     fpcs_analysis,
                     local_defs,
+                    spec_blocks,
                     body,
 
                     wands,
@@ -286,8 +317,12 @@ impl TaskEncoder for MethodEnc {
                     tmp_ctr: 0,
                     label_ctr: 0,
                     call_labels: Default::default(),
+                    wandless_calls: Default::default(),
                     from_to_vars: Default::default(),
 
+                    current_block: None,
+                    current_block_pres: None,
+                    current_block_succs: None,
                     current_block_label: None,
                     current_fpcs: None,
 
@@ -295,41 +330,55 @@ impl TaskEncoder for MethodEnc {
                     current_terminator: None,
                     encoded_blocks,
                 };
-                // if we encountered an error/cycle during encoding, we don't emit a method body
-                if visitor.visit_body(body).is_ok() {
-                    start_stmts.extend(
-                        visitor
-                            .from_to_vars
-                            .decls()
-                            .map(|v| vcx.mk_local_decl_stmt(v, Some(vcx.mk_bool::<false>()))),
-                    );
-                    visitor.encoded_blocks[0] = vcx.mk_cfg_block(
-                        &vir::CfgBlockLabelData::Start,
-                        &[],
-                        vcx.alloc_slice(&start_stmts),
-                        vcx.mk_goto_stmt(&vir::CfgBlockLabelData::BasicBlock(0)),
-                    );
+                // if we encountered an error/cycle during encoding, we don't
+                // emit a method body; encoding errors additionally surface as
+                // early errors rather than silently degrading to a stub
+                match visitor.visit_body(body) {
+                    Ok(()) => {
+                        start_stmts.extend(
+                            visitor
+                                .from_to_vars
+                                .decls()
+                                .map(|v| vcx.mk_local_decl_stmt(v, Some(vcx.mk_bool::<false>()))),
+                        );
+                        visitor.encoded_blocks[0] = vcx.mk_cfg_block(
+                            &vir::CfgBlockLabelData::Start,
+                            &[],
+                            vcx.alloc_slice(&start_stmts),
+                            vcx.mk_goto_stmt(&vir::CfgBlockLabelData::BasicBlock(0)),
+                        );
 
-                    visitor.encoded_blocks.push(vcx.mk_cfg_block(
-                        vcx.alloc(vir::CfgBlockLabelData::End),
-                        &[],
-                        &[],
-                        vcx.alloc(vir::TerminatorStmtData::Exit),
-                    ));
+                        visitor.encoded_blocks.push(vcx.mk_cfg_block(
+                            vcx.alloc(vir::CfgBlockLabelData::End),
+                            &[],
+                            &[],
+                            vcx.alloc(vir::TerminatorStmtData::Exit),
+                        ));
 
-                    visitor.deps.check_cycle()?;
+                        visitor.deps.check_cycle()?;
 
-                    Some(visitor.encoded_blocks)
-                } else {
-                    None
+                        Some(visitor.encoded_blocks)
+                    }
+                    Err(EncodeFullError::AlreadyEncoded) => None,
+                    Err(err) => {
+                        let (message, span) = super::dep_error(&err);
+                        vcx.emit_early_error(PrustiError::unsupported(
+                            format!(
+                                "cannot encode method body `{}`: {message}",
+                                vcx.tcx().def_path_str(def_id),
+                            ),
+                            span.unwrap_or_else(|| vcx.tcx().def_span(def_id)).into(),
+                        ));
+                        None
+                    }
                 }
             } else {
                 None
             };
 
             // Add functional specification as the last pre- and postconditions.
-            pres.extend(spec.pres);
-            posts.extend(spec.posts);
+            pres.extend(spec.pre_exprs());
+            posts.extend(spec.post_exprs());
 
             Ok((
                 MethodEncOutput {

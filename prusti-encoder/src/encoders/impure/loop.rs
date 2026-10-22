@@ -1,9 +1,12 @@
+use rustc_hash::FxHashMap;
+
 use pcg::{
     borrow_pcg::region_projection::{
-        HasRegions, LifetimeProjection, PcgLifetimeProjectionBase, PcgLifetimeProjectionBaseLike,
+        ExtractRegionsCtxt, LifetimeProjection, PcgLifetimeProjectionBase,
+        PcgLifetimeProjectionBaseLike,
     },
     r#loop::PlaceUsages,
-    pcg::{EvalStmtPhase, PcgNode},
+    pcg::{CapabilityKind, EvalStmtPhase, PcgNode},
     results::PcgBasicBlock,
     utils::{
         HasCompilerCtxt, HasPlace, Place, maybe_old::MaybeLabelledPlace,
@@ -16,7 +19,7 @@ use task_encoder::TaskEncoder;
 use vir::Reify;
 
 use crate::encoders::{
-    ImpureEncVisitor, TyUseImpureEnc,
+    EncodeResult, ImpureEncVisitor, TyUseImpureEnc,
     ty::{RustTyDecomposition, indirect::IndirectPredicatesEnc, use_impure::TyUseImpure},
 };
 
@@ -32,7 +35,14 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         cfpcs: &PcgBasicBlock<'_, 'vir>,
         loop_place_usages: &PlaceUsages<'vir>,
         ctxt: impl HasCompilerCtxt<'a, 'vir>,
-    ) -> &'vir [vir::ExprBool<'vir>] {
+    ) -> EncodeResult<
+        'vir,
+        (
+            Vec<vir::ExprBool<'vir>>,
+            FxHashMap<Place<'vir>, CapabilityKind>,
+        ),
+        E,
+    > {
         let mut inv = Vec::new();
         let start = &cfpcs.statements[0];
         let state = &start.states[EvalStmtPhase::PreOperands];
@@ -43,7 +53,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             if capability.is_write() {
                 continue; // No permissions are encoded for places with write capabilities currently
             }
-            let (place_res, _snap, _, _) = self.encode_place_with_snap(*place);
+            let (place_res, _snap, _, _) = self.encode_place_with_snap(*place)?;
             let ty = (*place).ty(self.pcg_ctxt());
             let task = RustTyDecomposition::from_ty(ty.ty, self.def_id);
             let ty_out = self.deps.require_dep::<TyUseImpureEnc>(task).unwrap();
@@ -52,7 +62,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             // gets all the lifetime projections of the place
             // for example, if we add an invariant for x and x is a reference, then we also want to add
             // an invariant for *x
-            let projs = place.lifetime_projections(ctxt);
+            let projs = ctxt.extract_lifetime_projections(place.with_inherent_region(ctxt));
             for proj in projs {
                 let indirect = self
                     .deps
@@ -71,7 +81,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             let mut let_bind = WandOldOuter::LetBind(Vec::new());
             let mut wand_rhs = Vec::new();
             for i in inputs {
-                self.encode_pcg_node(&i, &mut wand_rhs, &mut let_bind);
+                self.encode_pcg_node(&i, &mut wand_rhs, &mut let_bind)?;
             }
             let mut wand_lhs = Vec::new();
             for i in outputs {
@@ -79,7 +89,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     PcgNode::LifetimeProjection(region_projection) => region_projection,
                     PcgNode::Place(_) => unreachable!(),
                 };
-                let exprs = self.encode_lifetime_projection(i, &mut let_bind);
+                let exprs = self.encode_lifetime_projection(i, &mut let_bind)?;
                 wand_lhs.extend(exprs);
             }
             let wand = self.vcx.mk_wand(
@@ -98,7 +108,8 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             }
             inv.push(wand);
         }
-        self.vcx.alloc_slice(&inv)
+
+        Ok((inv, loop_invariant_place_capabilities.into_iter().collect()))
     }
 
     pub(super) fn encode_pcg_node<T: PcgLifetimeProjectionBaseLike<'vir>>(
@@ -106,35 +117,36 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         node: &PcgNode<'vir, MaybeLabelledPlace<'vir>, T>,
         wand_rhs: &mut Vec<vir::ExprBool<'vir>>,
         old_outer: &mut WandOldOuter<'vir>,
-    ) {
+    ) -> EncodeResult<'vir, (), E> {
         match node {
             PcgNode::Place(place) => {
                 let p = place.place();
                 let ty = (*p).ty(self.local_decls, self.vcx.tcx());
                 let task = RustTyDecomposition::from_ty(ty.ty, self.def_id);
                 let ty_out = self.deps.require_dep::<TyUseImpureEnc>(task).unwrap();
-                let p = self.encode_place(p);
+                let p = self.encode_place(p)?;
                 let p = self.configure_old((*place).into(), p.expr.expect_predicate(), old_outer);
 
                 let pred = ty_out.ref_to_pred(self.vcx, p, None);
                 wand_rhs.push(pred);
             }
             PcgNode::LifetimeProjection(r) => {
-                let exprs = self.encode_lifetime_projection(*r, old_outer);
+                let exprs = self.encode_lifetime_projection(*r, old_outer)?;
                 wand_rhs.extend(exprs);
             }
         }
+        Ok(())
     }
 
     pub(super) fn encode_lifetime_projection<T: PcgLifetimeProjectionBaseLike<'vir>>(
         &mut self,
         r: LifetimeProjection<'vir, T>,
         old_outer: &mut WandOldOuter<'vir>,
-    ) -> Vec<vir::ExprBool<'vir>> {
+    ) -> EncodeResult<'vir, Vec<vir::ExprBool<'vir>>, E> {
         let place = r.base().to_pcg_lifetime_projection_base();
         let (place_snap, ty, _) = match place {
             PcgLifetimeProjectionBase::Place(p) => {
-                self.encode_maybe_remote_place_snap(p, old_outer)
+                self.encode_maybe_remote_place_snap(p, old_outer)?
             }
             PcgLifetimeProjectionBase::Const(c) => todo!("{c:?}"),
         };
@@ -143,11 +155,11 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             .deps
             .require_dep::<IndirectPredicatesEnc>(r.with_base(ty))
             .unwrap();
-        indirect
+        Ok(indirect
             .predicate_applications
             .into_iter()
             .map(|expr| expr.reify(self.vcx, place_snap))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     }
 
     fn get_place(place: MaybeRemotePlace<'vir>) -> Place<'vir> {
@@ -162,11 +174,11 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         &mut self,
         place: MaybeRemotePlace<'vir>,
         old_outer: &mut WandOldOuter<'vir>,
-    ) -> (vir::ExprSnap<'vir>, mir::PlaceTy<'vir>, TyUseImpure<'vir>) {
+    ) -> EncodeResult<'vir, (vir::ExprSnap<'vir>, mir::PlaceTy<'vir>, TyUseImpure<'vir>), E> {
         let p = Self::get_place(place);
-        let (_, place_snap, ty, ty_out) = self.encode_place_with_snap(p);
+        let (_, place_snap, ty, ty_out) = self.encode_place_with_snap(p)?;
         let place_snap = self.configure_old(place, place_snap, old_outer);
-        (place_snap, ty, ty_out)
+        Ok((place_snap, ty, ty_out))
     }
 
     fn configure_old<T: SnapOrRef>(

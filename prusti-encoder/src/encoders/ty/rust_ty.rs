@@ -1,40 +1,25 @@
 use std::ops::Deref;
 
-use itertools::Itertools;
-use pcg::borrow_pcg::region_projection::{HasRegions, PcgRegion, RegionIdx};
 use prusti_interface::environment::EnvQuery;
-use prusti_rustc_interface::{
-    abi, hir,
-    index::{self, IndexVec},
-    middle::ty,
-    span::symbol,
-};
+use prusti_rustc_interface::{abi, hir::attrs::LangItem, index, middle::ty, span::symbol};
 
 use super::{
     data::*,
-    generics::{GArgs, GParams},
+    generics::{GArgs, GParams, identity_params},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RustTyDecomposition<'tcx> {
     pub ty: RustTy<'tcx>,
     pub args: GArgs<'tcx>,
-    pub maybe_inhabited: bool,
-}
-
-impl<'tcx, Ctxt: Copy> HasRegions<'tcx, Ctxt> for RustTyDecomposition<'tcx> {
-    fn regions(&self, _ctxt: Ctxt) -> IndexVec<RegionIdx, PcgRegion<'tcx>> {
-        self.args
-            .args()
-            .iter()
-            .flat_map(|arg| arg.walk())
-            .filter_map(|arg| arg.as_region().map(PcgRegion::from))
-            .unique()
-            .collect()
-    }
 }
 
 impl<'tcx> RustTyDecomposition<'tcx> {
+    fn new(ty: RustTy<'tcx>, args: GArgs<'tcx>) -> Self {
+        ty.params.check(args.args());
+        RustTyDecomposition { ty, args }
+    }
+
     /// Decomposes a rustc `ty::Ty` into the core type used to generate a Viper
     /// domain/predicate and its type arguments (not used for the Viper
     /// definition). For example, for the function:
@@ -69,32 +54,37 @@ impl<'tcx> RustTyDecomposition<'tcx> {
         TyData::<'tcx, RustTyDatas>::from_ty(ty, context.into())
     }
 
-    pub fn from_real() -> Self {
-        let data = RustTyData {
-            name: symbol::Symbol::intern("Real"),
-            params: GParams::empty(),
-        };
-        let specifics = TySpecifics::Builtin(RustBuiltinData::BuiltinReal);
-        Self {
-            ty: TyData::<'tcx, RustTyDatas>::new(data, specifics).alloc(),
-            args: GArgs::new(GParams::empty(), &[]),
-            maybe_inhabited: true,
-        }
-    }
-
     /// Same as `from_ty` to get a `RustTyDecomposition` for use in encoding,
     /// but requires fewer arguments when the type is known to be primitive.
     pub fn from_prim_ty(ty: ty::Ty<'tcx>) -> Self {
         assert!(ty.is_primitive());
         TyData::<'tcx, RustTyDatas>::from_prim_ty(ty)
     }
+
+    /// When you only have a `RustTy<'tcx>` but you want to use one of the
+    /// type-use encoders.
+    pub fn identity(ty: RustTy<'tcx>) -> Self {
+        let args = GArgs::new(ty.params, ty.params.rust_params());
+        Self::new(ty, args)
+    }
+
+    pub fn param() -> RustTy<'tcx> {
+        let gty = TyData::<RustTyDatas>::args_from_tys([TySpecifics::new_param_ty(0)]);
+        let data = RustTyData {
+            name: symbol::Symbol::intern("Param"),
+            params: GParams::empty_env(gty),
+            special: RustTySpecial::None,
+            sizedness: RustTySizedness::None,
+        };
+        let specifics = TySpecifics::Param(RustParamData::Generic);
+        TyData::<RustTyDatas>::new(data, specifics).alloc()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RustTyNormalized<'tcx> {
     pub param: RustTy<'tcx>,
-    pub concrete: RustTy<'tcx>,
-    pub args: GArgs<'tcx>,
+    pub concrete: RustTyDecomposition<'tcx>,
 }
 
 /// A to-be decomposed Rust type. We need this since we cannot infinitely
@@ -113,6 +103,32 @@ impl<'tcx> LazyRustTy<'tcx> {
         // SAFETY: `LazyRustTy` is `repr(transparent)` over `ty::Ty`
         let ptr = tys as *const [ty::Ty<'tcx>] as *const [Self];
         unsafe { &*ptr }
+    }
+
+    /// The (sized) type parameter at the given index. `decompose`d against a
+    /// `GParams` that declares it, this yields a `Param` decomposition whose
+    /// argument is that type variable. Used to make a builtin method generic
+    /// over one of the reference's type parameters.
+    ///
+    /// You very likely do NOT want to use this: it's a hacky thing to make
+    /// `MirBuiltinCastEnc` work.
+    pub fn new_param_ty(index: u32) -> Self {
+        Self::new(TySpecifics::new_param_ty(index))
+    }
+
+    /// The pointer metadata type of a pointer to this type.
+    fn pointee_metadata(self) -> Self {
+        vir::with_vcx(|vcx| {
+            let metadata_did = vcx
+                .tcx()
+                .require_lang_item(LangItem::Metadata, prusti_rustc_interface::span::DUMMY_SP);
+            Self::new(ty::Ty::new_projection(
+                vcx.tcx(),
+                ty::IsRigid::No,
+                metadata_did,
+                [self.0],
+            ))
+        })
     }
 }
 
@@ -192,15 +208,11 @@ impl<'tcx> LazyRustTy<'tcx> {
         let TySpecifics::Param(..) = &param.specifics else {
             return None;
         };
-        let RustTyDecomposition { ty, args, .. } = self.decompose_normalize(args);
-        if let TySpecifics::Param(..) = &ty.specifics {
+        let concrete = self.decompose_normalize(args);
+        if let TySpecifics::Param(..) = &concrete.ty.specifics {
             None
         } else {
-            Some(RustTyNormalized {
-                param,
-                concrete: ty,
-                args,
-            })
+            Some(RustTyNormalized { param, concrete })
         }
     }
 }
@@ -213,8 +225,12 @@ impl<'tcx> TyDatas<'tcx> for RustTyDatas {
     type PrimitiveData = ty::Ty<'tcx>;
     type ParamData = RustParamData;
     type ArrayData = LazyRustTy<'tcx>;
-    type ImmRefData = LazyRustTy<'tcx>;
-    type MutRefData = LazyRustTy<'tcx>;
+    type ImmRefData = RefData<'tcx>;
+    type MutRefData = RefData<'tcx>;
+    /// Raw pointers reuse the reference `RefData` (metadata + pointee), but are
+    /// encoded conservatively as their own `Raw` kind: the snapshot exposes the
+    /// address and pointer metadata without reasoning about the pointee.
+    type RawData = RefData<'tcx>;
     type StructData = ();
     type FieldData = RustFieldData<'tcx>;
     type EnumData = RustEnumData<'tcx>;
@@ -224,9 +240,13 @@ impl<'tcx> TyDatas<'tcx> for RustTyDatas {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RustBuiltinData {
-    BuiltinReal,
-    BuiltinGhost,
+pub enum RustBuiltinData<'tcx> {
+    Int,
+    Real,
+    Set(LazyRustTy<'tcx>),
+    Multiset(LazyRustTy<'tcx>),
+    Seq(LazyRustTy<'tcx>),
+    Map(LazyRustTy<'tcx>, LazyRustTy<'tcx>),
 }
 
 /// An internal representation of a `ty::Ty`. Contains all that we care about
@@ -238,13 +258,71 @@ pub type RustParam<'tcx> = <RustTyDatas as TyDatas<'tcx>>::ParamData;
 pub type RustPrimitive<'tcx> = <RustTyDatas as TyDatas<'tcx>>::PrimitiveData;
 pub type RustImmRef<'tcx> = <RustTyDatas as TyDatas<'tcx>>::ImmRefData;
 pub type RustMutRef<'tcx> = <RustTyDatas as TyDatas<'tcx>>::MutRefData;
+pub type RustRaw<'tcx> = <RustTyDatas as TyDatas<'tcx>>::RawData;
 pub type RustBuiltin<'tcx> = <RustTyDatas as TyDatas<'tcx>>::BuiltinData;
 pub type RustRawPtr<'tcx> = <RustTyDatas as TyDatas<'tcx>>::RawPtrData;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RustTyData<'tcx> {
     pub name: symbol::Symbol,
     pub params: GParams<'tcx>,
+    pub special: RustTySpecial,
+    pub sizedness: RustTySizedness<'tcx>,
+}
+
+/// Which of the sizedness traits (`Sized`, `MetaSized`, `PointeeSized`) the
+/// constructor's instances implement. These traits have no impls, so their
+/// facts are encoded per constructor instead (see `SizednessEnc`). Mirrors
+/// `Ty::has_trivial_sizedness`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RustTySizedness<'tcx> {
+    /// Not a type constructor (a type parameter or projection).
+    None,
+    /// `Sized` and `MetaSized` exactly when the respective tail type, over
+    /// the constructor's parameters, is; unconditionally if there is none.
+    Sized {
+        sized_if: Option<ty::Ty<'tcx>>,
+        meta_sized_if: Option<ty::Ty<'tcx>>,
+    },
+    /// `MetaSized` but not `Sized`: `str`, slices and trait objects.
+    MetaSized,
+    /// Only `PointeeSized`: extern types.
+    PointeeSized,
+}
+
+impl<'tcx> RustTySizedness<'tcx> {
+    fn from_ty(ty: ty::Ty<'tcx>) -> Self {
+        let tail = |kind| match *ty.kind() {
+            ty::TyKind::Adt(adt, _) => vir::with_vcx(|vcx| {
+                adt.sizedness_constraint(vcx.tcx(), kind)
+                    .map(ty::EarlyBinder::instantiate_identity)
+                    .map(ty::Unnormalized::skip_normalization)
+            }),
+            ty::TyKind::Tuple(tys) => tys
+                .len()
+                .checked_sub(1)
+                .map(|last| TySpecifics::new_param_ty(last as u32)),
+            _ => None,
+        };
+        match ty.kind() {
+            ty::TyKind::Param(_) | ty::TyKind::Alias(..) => Self::None,
+            ty::TyKind::Str | ty::TyKind::Slice(_) | ty::TyKind::Dynamic(..) => Self::MetaSized,
+            ty::TyKind::Foreign(_) => Self::PointeeSized,
+            _ => Self::Sized {
+                sized_if: tail(ty::SizedTraitKind::Sized),
+                meta_sized_if: tail(ty::SizedTraitKind::MetaSized),
+            },
+        }
+    }
+}
+
+/// Marks types with extra hardcoded treatment on top of their regular encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RustTySpecial {
+    None,
+    /// `alloc::boxed::Box`: its snapshot also carries the value of the boxed
+    /// `T` and its predicate permission to it (see the structlike encoder).
+    Box,
 }
 
 impl<'tcx> RustTyData<'tcx> {
@@ -253,11 +331,31 @@ impl<'tcx> RustTyData<'tcx> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RefData<'tcx> {
+    /// Will always be a `LazyRustTy::pointee_metadata` (`TyKind::Alias`).
+    pub metadata: LazyRustTy<'tcx>,
+    /// Will always be `ParamTy { index: 1, .. }`, the concrete type can be
+    /// found in the `args` of the containing `RustTyDecomposition`.
+    pub referent: LazyRustTy<'tcx>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RustFieldData<'tcx> {
     pub name: symbol::Symbol,
     pub fid: abi::FieldIdx,
     ty: LazyRustTy<'tcx>,
+    pub address: RustFieldAddress,
+}
+
+/// How the address of a field is obtained from that of the containing struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RustFieldAddress {
+    /// A constant offset: a pure function of the struct's `Ref`.
+    Constant,
+    /// Stored in the struct's value (the value of a `Box`, at its pointer):
+    /// only a function of the struct's snapshot.
+    Dynamic,
 }
 
 impl<'tcx> RustFieldData<'tcx> {
@@ -266,14 +364,14 @@ impl<'tcx> RustFieldData<'tcx> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RustVariantData {
     pub name: symbol::Symbol,
     pub vid: abi::VariantIdx,
     pub discr_val: u128,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RustEnumData<'tcx> {
     pub discr: ty::Ty<'tcx>,
 }
@@ -296,6 +394,22 @@ impl<'tcx> Deref for RustFieldData<'tcx> {
 }
 
 impl<'tcx> TyData<'tcx, RustTyDatas> {
+    pub fn ref_data(&self) -> Option<RefData<'tcx>> {
+        match &self.specifics {
+            TySpecifics::ImmRef(data) | TySpecifics::MutRef(data) | TySpecifics::Raw(data) => {
+                Some(*data)
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of the value stored in a `Box` (its hardcoded last field, see
+    /// `TySpecifics::from_adt`).
+    pub fn box_value_ty(&self) -> LazyRustTy<'tcx> {
+        assert_eq!(self.special, RustTySpecial::Box);
+        self.expect_structlike().fields.last().unwrap().ty()
+    }
+
     fn from_ty(ty: ty::Ty<'tcx>, context: GParams<'tcx>) -> RustTyDecomposition<'tcx> {
         // We normalize since we may be translating a type such as the field of
         // `struct MyStruct<T: Iterator<Item = i32>>(T::Item);` where `ty` is
@@ -307,18 +421,14 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
         let name = Self::ty_name(ty);
         let (params, args) = Self::identity_for_ty(ty, context.is_trait_extern_spec());
         let args = GArgs::new(context, args);
+        let specifics = TySpecifics::from_ty(ty);
         let data = RustTyData {
             name: symbol::Symbol::intern(&name),
             params,
+            special: RustTySpecial::from_ty(ty),
+            sizedness: RustTySizedness::from_ty(ty),
         };
-        let specifics = TySpecifics::from_ty(ty);
-        let maybe_inhabited =
-            vir::with_vcx(|vcx| !ty.is_privately_uninhabited(vcx.tcx(), context.typing_env()));
-        RustTyDecomposition {
-            ty: Self::new(data, specifics).alloc(),
-            args,
-            maybe_inhabited,
-        }
+        RustTyDecomposition::new(Self::new(data, specifics).alloc(), args)
     }
 
     fn from_prim_ty(ty: ty::Ty<'tcx>) -> RustTyDecomposition<'tcx> {
@@ -328,22 +438,25 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
         let data = RustTyData {
             name: symbol::Symbol::intern(&name),
             params,
+            special: RustTySpecial::None,
+            sizedness: RustTySizedness::from_ty(ty),
         };
         let specifics = TySpecifics::from_prim_ty(ty);
-        RustTyDecomposition {
-            ty: Self::new(data, specifics).alloc(),
-            args,
-            maybe_inhabited: true,
-        }
+        RustTyDecomposition::new(Self::new(data, specifics).alloc(), args)
     }
 
     fn ty_name(ty: ty::Ty<'tcx>) -> String {
+        let def_id_name = |def_id| {
+            vir::with_vcx(|vcx| {
+                vir::ViperIdent::from_def_id(vcx, def_id)
+                    .to_str()
+                    .to_owned()
+            })
+        };
         match ty.kind() {
             _ if ty.is_primitive() => Self::prim_ty_name(ty),
             ty::TyKind::Str => String::from("Str"),
-            ty::TyKind::Adt(adt, _) => {
-                vir::with_vcx(|vcx| vcx.tcx().item_name(adt.did()).to_ident_string())
-            }
+            ty::TyKind::Adt(adt, _) => def_id_name(adt.did()),
             ty::TyKind::Tuple(params) => format!("{}_Tuple", params.len()),
             ty::TyKind::Never => String::from("Never"),
             ty::TyKind::Ref(_, _, ty::Mutability::Not) => String::from("Ref_immutable"),
@@ -351,26 +464,13 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             ty::TyKind::RawPtr(_, ty::Mutability::Not) => String::from("RawPtr_immutable"),
             ty::TyKind::RawPtr(_, ty::Mutability::Mut) => String::from("RawPtr_mutable"),
             ty::TyKind::Param(_) | ty::TyKind::Alias(..) => String::from("Param"),
-            ty::TyKind::Closure(def_id, _) => vir::with_vcx(|vcx| {
-                let def_key = vcx.tcx().def_key(def_id);
-                match def_key.disambiguated_data.data {
-                    // Asking for the item_name of a closure triggers an ICE in
-                    // the compiler, so we give it a name based on its parent.
-                    hir::definitions::DefPathData::Closure => format!(
-                        "{}_Closure_{}",
-                        vcx.tcx().item_name(hir::def_id::DefId {
-                            krate: def_id.krate,
-                            index: def_key.parent.unwrap()
-                        }),
-                        def_key.disambiguated_data.disambiguator,
-                    ),
-                    _ => vcx.tcx().item_name(*def_id).to_ident_string(),
-                }
-            }),
+            ty::TyKind::Closure(def_id, _) => def_id_name(*def_id),
             ty::TyKind::FnPtr(..) => String::from("FnPtr"),
             ty::TyKind::Array(..) => String::from("Array"),
             ty::TyKind::Slice(..) => String::from("Slice"),
             ty::TyKind::Dynamic(..) => String::from("Dyn"),
+            ty::TyKind::Foreign(def_id) | ty::TyKind::FnDef(def_id, _) => def_id_name(*def_id),
+            ty::TyKind::Pat(ty, _) => Self::ty_name(*ty),
             other => unimplemented!("ty_name for {:?}", other),
         }
     }
@@ -423,18 +523,32 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
                     Self::args_from_generics([cst.into(), ty.into()]),
                 )
             }),
-            ty::TyKind::Slice(ty) | ty::TyKind::RawPtr(ty, _) => {
+            ty::TyKind::Slice(ty) => {
                 let gty = Self::args_from_tys([TySpecifics::new_param_ty(0)]);
                 (GParams::empty_env(gty), Self::args_from_tys([ty]))
             }
-            ty::TyKind::Ref(region, ty, _) => {
+            ty::TyKind::RawPtr(pointee, _) => {
+                // Like a reference, a raw pointer's pointer-metadata type is
+                // derived from the pointee via `<pointee as Pointee>::Metadata`
+                // (see `RefData` below), so it has a single generic: the pointee.
+                let pointee_ty = TySpecifics::new_param_ty(0).into();
+                let gty = Self::args_from_generics([pointee_ty]);
+                (
+                    GParams::empty_env(gty),
+                    Self::args_from_generics([pointee.into()]),
+                )
+            }
+            ty::TyKind::Ref(region, inner, _) => {
+                // The pointer-metadata type is derived from the referent (see
+                // `RefData` below and `LazyRustTy::pointee_metadata`), so a
+                // reference has just two generics: the lifetime and the referent.
                 // TODO: what lifetime should we use here?
                 let param_region = vir::with_vcx(|vcx| vcx.tcx().lifetimes.re_erased.into());
                 let param_ty = TySpecifics::new_param_ty(1).into();
                 let gty = Self::args_from_generics([param_region, param_ty]);
                 (
                     GParams::empty_env(gty),
-                    Self::args_from_generics([region.into(), ty.into()]),
+                    Self::args_from_generics([region.into(), inner.into()]),
                 )
             }
             ty::TyKind::Alias(..) | ty::TyKind::Param(_) => {
@@ -450,10 +564,19 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
                     args,
                 )
             }),
+            ty::TyKind::FnDef(did, args) => vir::with_vcx(|vcx| {
+                let gargs = identity_params(vcx.tcx(), did);
+                (
+                    GParams::new(gargs, vcx.tcx().param_env(did), is_trait_extern_spec),
+                    args.skip_binder(),
+                )
+            }),
+            ty::TyKind::Pat(ty, _) => Self::identity_for_ty(ty, is_trait_extern_spec),
             ty::TyKind::Never
             | ty::TyKind::Str
             | ty::TyKind::FnPtr(..)
-            | ty::TyKind::Dynamic(..) => (GParams::empty(), ty::GenericArgs::empty()),
+            | ty::TyKind::Dynamic(..)
+            | ty::TyKind::Foreign(_) => (GParams::empty(), ty::GenericArgs::empty()),
             _ => todo!("instantiate_identity_for_type for {:?}", ty),
         };
         params.check(args);
@@ -476,6 +599,24 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
     }
 }
 
+/// For a `RustTy` zipped with another (encoded) type data.
+impl<'tcx, D: TyDatas<'tcx>> TyData<'tcx, (RustTyDatas, D)> {
+    pub fn box_metadata_ty(&self) -> LazyRustTy<'tcx> {
+        assert_eq!(self.0.special, RustTySpecial::Box);
+        let box_value_ty = self.expect_structlike().fields.last().unwrap().0.ty();
+        box_value_ty.pointee_metadata()
+    }
+}
+
+impl RustTySpecial {
+    fn from_ty(ty: ty::Ty<'_>) -> Self {
+        match ty.kind() {
+            ty::TyKind::Adt(adt, _) if adt.is_box() => RustTySpecial::Box,
+            _ => RustTySpecial::None,
+        }
+    }
+}
+
 impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
     fn from_ty(ty: ty::Ty<'tcx>) -> Self {
         if ty.is_primitive() {
@@ -495,6 +636,7 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
                         name: symbol::Symbol::intern(&format!("_{i}")),
                         fid: abi::FieldIdx::from_usize(i),
                         ty: LazyRustTy(Self::new_param_ty(i as u32)),
+                        address: RustFieldAddress::Constant,
                     })
                     .collect::<Vec<_>>();
                 TySpecifics::mk_structlike((), fields)
@@ -507,12 +649,18 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
                 slice: true,
                 data: LazyRustTy(Self::new_param_ty(0)),
             }),
-            ty::TyKind::Ref(_, _, mutability) => match mutability {
-                ty::Mutability::Mut => {
-                    TySpecifics::mk_mutref(LazyRustTy(TySpecifics::new_param_ty(1)))
-                }
-                ty::Mutability::Not => {
-                    TySpecifics::mk_immref(LazyRustTy(TySpecifics::new_param_ty(1)))
+            ty::TyKind::Ref(_, _, mutability) => {
+                // The referent is generic parameter 1; its pointer metadata is
+                // derived as `<referent as Pointee>::Metadata` rather than being
+                // a separate generic parameter.
+                let referent = LazyRustTy(Self::new_param_ty(1));
+                let data = RefData {
+                    metadata: referent.pointee_metadata(),
+                    referent,
+                };
+                match mutability {
+                    ty::Mutability::Mut => TySpecifics::mk_mutref(data),
+                    ty::Mutability::Not => TySpecifics::mk_immref(data),
                 }
             },
             ty::TyKind::RawPtr(..) => {
@@ -530,7 +678,8 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
                         .map(|(i, ty)| RustFieldData {
                             name: symbol::Symbol::intern(&format!("c{i}")),
                             fid: abi::FieldIdx::from_usize(i),
-                            ty: LazyRustTy(vcx.tcx().erase_regions(ty)),
+                            ty: LazyRustTy(vcx.tcx().erase_and_anonymize_regions(ty)),
+                            address: RustFieldAddress::Constant,
                         })
                         .collect::<Vec<_>>()
                 });
@@ -547,6 +696,11 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
             // TODO: give dyn Trait a type witness parameter (the concrete type behind the
             // pointer), enabling virtual dispatch and distinguishing dyn TraitA from dyn TraitB.
             ty::TyKind::Dynamic(..) => TySpecifics::mk_param(RustParamData::Dyn),
+            // TODO: encode the pattern as narrowed bounds on the base type, so that e.g.
+            // the `u32 is 1..` inside a `NonZeroU32` is known to be non-zero. Doing so
+            // also needs a `ty_name` that distinguishes the pattern from its base type,
+            // since the name and the specifics together are the interning key.
+            ty::TyKind::Pat(ty, _) => Self::from_ty(*ty),
             _ => TySpecifics::mk_opaque(()),
         }
     }
@@ -557,25 +711,58 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
     }
 
     fn from_adt(adt: ty::AdtDef<'tcx>) -> Self {
-        if adt.is_box() {
-            let fields = vec![RustFieldData {
-                name: symbol::Symbol::intern("deref"),
-                fid: abi::FieldIdx::from_usize(0),
-                ty: LazyRustTy(Self::new_param_ty(0)),
-            }];
-            TySpecifics::mk_structlike((), fields)
+        if vir::with_vcx(|vcx| vcx.tcx().lang_items().get(LangItem::DynMetadata) == Some(adt.did()))
+        {
+            // `DynMetadata<dyn Trait>` is the metadata of a `&dyn`/`*dyn`
+            // wide pointer. We never reason about vtable contents, so encode it
+            // as an opaque snapshot rather than recursing into its `Foreign`
+            // `VTable` field (which has no `ty_name`).
+            TySpecifics::mk_opaque(())
         } else if vir::with_vcx(|vcx| {
             EnvQuery::new(vcx.tcx()).is_adt_in_crate(adt, "prusti_contracts")
         }) {
             match adt.non_enum_variant().name.to_string().as_str() {
-                "Real" => Self::Builtin(RustBuiltinData::BuiltinReal),
-                "Ghost" => Self::Builtin(RustBuiltinData::BuiltinGhost),
-                s => panic!("Found unrecognized builtin {s}"),
+                "Int" => Self::Builtin(RustBuiltinData::Int),
+                "Real" => Self::Builtin(RustBuiltinData::Real),
+                "Set" => Self::Builtin(RustBuiltinData::Set(LazyRustTy(Self::new_param_ty(0)))),
+                "Multiset" => {
+                    Self::Builtin(RustBuiltinData::Multiset(LazyRustTy(Self::new_param_ty(0))))
+                }
+                "Seq" => Self::Builtin(RustBuiltinData::Seq(LazyRustTy(Self::new_param_ty(0)))),
+                "Map" => Self::Builtin(RustBuiltinData::Map(
+                    LazyRustTy(Self::new_param_ty(0)),
+                    LazyRustTy(Self::new_param_ty(1)),
+                )),
+                // `Ghost<T>` is encoded as if it were `struct Ghost<T>(T)`:
+                // the snapshot wraps the value of `T`.
+                "Ghost" => {
+                    let fields = vec![RustFieldData {
+                        name: symbol::Symbol::intern("val"),
+                        fid: abi::FieldIdx::from_usize(0),
+                        ty: LazyRustTy(Self::new_param_ty(0)),
+                        address: RustFieldAddress::Constant,
+                    }];
+                    TySpecifics::mk_structlike((), fields)
+                }
+                // TODO: support other builtins (e.g. `Seq`, `Map`, `Set`, etc.)
+                s => todo!("Unimplemented builtin {s}"),
             }
         } else {
             match adt.adt_kind() {
                 ty::AdtKind::Struct => {
-                    let data = Self::from_struct(adt.non_enum_variant());
+                    let mut data = Self::from_struct(adt.non_enum_variant());
+                    if adt.is_box() {
+                        // The hardcoded value slot for the boxed `T` is
+                        // appended as a regular field; only its (heap-dependent)
+                        // field accessor and the pointer metadata are
+                        // special-cased (see the structlike encoder).
+                        data.fields.push(RustFieldData {
+                            name: symbol::Symbol::intern("value"),
+                            fid: abi::FieldIdx::from_usize(data.fields.len()),
+                            ty: LazyRustTy(Self::new_param_ty(0)),
+                            address: RustFieldAddress::Dynamic,
+                        });
+                    }
                     Self::StructLike(data)
                 }
                 ty::AdtKind::Enum => {
@@ -629,7 +816,8 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
                 RustFieldData {
                     name: field.name,
                     fid,
-                    ty: LazyRustTy(ty),
+                    ty: LazyRustTy(ty.skip_normalization()),
+                    address: RustFieldAddress::Constant,
                 }
             })
             .collect::<Vec<_>>()

@@ -2,8 +2,6 @@
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(never_type)]
-#![feature(allocator_api)]
-#![feature(if_let_guard)]
 #![allow(clippy::needless_lifetimes)]
 
 mod encoders;
@@ -21,13 +19,19 @@ use task_encoder::TaskEncoder;
 use crate::encoders::{
     ConstEnc, Impure, Pure,
     addr::RefDataEnc,
-    custom::PairUseEnc,
+    custom::{PairUseEnc, ReadPermEnc},
     ty::{
         generics::{
-            GArgsCastEnc, r#trait::TraitEnc, trait_fn::TraitFnEnc, trait_impls::TraitImplEnc,
+            GArgsCastEnc,
+            sizedness::SizednessEnc,
+            r#trait::TraitEnc,
+            trait_fn::TraitFnEnc,
+            trait_impls::{
+                TraitImplConditionEnc, TraitImplDefaultFnEnc, TraitImplEnc, TraitImplItemEnc,
+            },
         },
         interpretation::bitvec::BitVecEnc,
-        lifted::{TyConstructorEnc, TypeOfEnc},
+        lifted::TyConstructorEnc,
     },
 };
 
@@ -59,7 +63,12 @@ pub fn test_entrypoint<'tcx>(
     procedures: Option<Vec<DefId>>,
     env_diagnostic: &EnvDiagnostic<'tcx>,
 ) -> request::RequestWithContext {
-    vir::init_vcx(vir::VirCtxt::new(tcx, body, def_spec));
+    let ident_style = if config::short_viper_names() {
+        vir::IdentStyle::ItemName
+    } else {
+        vir::IdentStyle::DefPath
+    };
+    vir::init_vcx(vir::VirCtxt::new(tcx, body, def_spec, ident_style));
     SELECTIVE_TASKS.with(|selective_tasks| {
         if let Some(procs) = procedures {
             selective_tasks
@@ -69,6 +78,7 @@ pub fn test_entrypoint<'tcx>(
     });
 
     crate::encoders::encode_all_in_crate(tcx);
+    task_encoder::drain_triggers();
 
     if config::show_ide_info() {
         vir::with_vcx(|vcx| vcx.emit_contract_spans(env_diagnostic));
@@ -86,7 +96,16 @@ pub fn test_entrypoint<'tcx>(
     crate::encoders::MethodCallEnc::emit_outputs(&mut program);
 
     program.header("MIR builtins");
-    crate::encoders::MirBuiltinEnc::emit_outputs(&mut program);
+    crate::encoders::MirBuiltinUnOpEnc::emit_outputs(&mut program);
+    crate::encoders::MirBuiltinBinOpEnc::emit_outputs(&mut program);
+    crate::encoders::MirBuiltinUseCastEnc::emit_outputs(&mut program);
+    // Unsize casts call `metadata_cast`; the `&mut` methods call
+    // `value_cast`. Both domains must be emitted too.
+    crate::encoders::MetadataCastEnc::emit_outputs(&mut program);
+    crate::encoders::ValueCastEnc::emit_outputs(&mut program);
+    crate::encoders::MetadataCastAxiomEnc::emit_outputs(&mut program);
+    crate::encoders::ValueCastAxiomEnc::emit_outputs(&mut program);
+    crate::encoders::PrustiBuiltinEnc::emit_outputs(&mut program);
 
     program.header("pure generic casts");
     GArgsCastEnc::<Pure>::emit_outputs(&mut program);
@@ -103,19 +122,24 @@ pub fn test_entrypoint<'tcx>(
 
     program.header("type constructors");
     TyConstructorEnc::emit_outputs(&mut program);
-    TypeOfEnc::emit_outputs(&mut program);
+    crate::encoders::TyInhabitedEnc::emit_outputs(&mut program);
 
     program.header("constants");
     ConstEnc::emit_outputs(&mut program);
 
     program.header("custom");
     PairUseEnc::emit_outputs(&mut program);
+    ReadPermEnc::emit_outputs(&mut program);
     RefDataEnc::emit_outputs(&mut program);
 
     program.header("traits");
     TraitEnc::emit_outputs(&mut program);
+    SizednessEnc::emit_outputs(&mut program);
     TraitFnEnc::emit_outputs(&mut program);
     TraitImplEnc::emit_outputs(&mut program);
+    TraitImplConditionEnc::emit_outputs(&mut program);
+    TraitImplItemEnc::emit_outputs(&mut program);
+    TraitImplDefaultFnEnc::emit_outputs(&mut program);
 
     if std::env::var("LOCAL_TESTING").is_ok() {
         std::fs::write("local-testing/simple.vpr", program.code()).unwrap();
@@ -123,6 +147,13 @@ pub fn test_entrypoint<'tcx>(
 
     for (error_msg, span) in program.encoder_errors().drain(..) {
         PrustiError::internal(error_msg, span.into()).emit(env_diagnostic);
+    }
+
+    // Errors raised during encoding (e.g. an unsupported feature that was
+    // replaced by an abstract stub) so that they surface rather than silently
+    // degrading.
+    for error in early_errors() {
+        error.emit(env_diagnostic);
     }
 
     let program = program.mk_program();
@@ -140,6 +171,6 @@ pub fn backtranslate_error(
     error_kind: &str,
     offending_pos_id: usize,
     reason_pos_id: Option<usize>,
-) -> Option<Vec<PrustiError>> {
+) -> Vec<PrustiError> {
     vir::with_vcx(|vcx| vcx.backtranslate(error_kind, offending_pos_id, reason_pos_id))
 }

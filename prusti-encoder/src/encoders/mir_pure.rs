@@ -8,12 +8,8 @@ use crate::encoders::{
         RustTyDecomposition, generics::{GArgsTyEnc, GParams}, interpretation::real::TyRealLocal, lifted::TyConstructorEnc, use_pure::{TyUsePure, TyUsePureEnc}
     },
 };
+use itertools::Itertools;
 use pcg::utils::Place;
-use prusti_interface::{
-    PrustiError,
-    environment::EnvQuery,
-    specs::{specifications::SpecQuery, typed::ExternSpecKind},
-};
 use prusti_rustc_interface::{
     abi,
     abi::{FieldIdx, VariantIdx},
@@ -24,9 +20,9 @@ use prusti_rustc_interface::{
         mir::Mutability,
         ty::{self, Binder, FnSig, List, Region, TyKind},
     },
-    span::{Span, def_id::DefId, source_map::Spanned},
+    span::{Span, Spanned, def_id::DefId},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, CompType, Reify, add_debug_note};
@@ -39,18 +35,20 @@ pub enum MirPureEncError {
     // UnsupportedTerminator,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Old,
-    Rel(usize),
-    BeforeExpiry,
-}
-
-// TODO: does this need to be `&'vir [..]`?
-pub type ExprInput<'vir> = (DefId, &'vir [vir::ExprSnap<'vir>]);
+pub type ExprInput<'vir> = (
+    DefId,
+    &'vir FxHashMap<mir::Local, vir::ExprSnap<'vir>>,
+    vir::OldLabel<'vir>,
+);
 type ExprRet<'vir> = vir::ExprGenSnap<'vir, ExprInput<'vir>, vir::ExprKind<'vir>>;
 type ExprRetRef<'vir> = vir::ExprGenRef<'vir, ExprInput<'vir>, vir::ExprKind<'vir>>;
 type ExprRetAny<'vir, T> = vir::ExprGen<'vir, ExprInput<'vir>, vir::ExprKind<'vir>, T>;
+/// An encoded spec closure (see `Enc::encode_spec_closure`): the quantified
+/// variables derived from the closure's arguments, and the closure's body.
+type SpecClosure<'vir> = (
+    &'vir [vir::LocalDeclSnap<'vir>],
+    ExprRetAny<'vir, vir::Bool>,
+);
 
 #[derive(Clone, Debug)]
 pub enum MirPureEncOutput<'vir> {
@@ -72,18 +70,20 @@ impl<'vir> MirPureEncOutput<'vir> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PureKind {
     Closure,
-    Spec(Option<ExternSpecKind>),
+    /// A specification, attached to the item `context` specifies. That is
+    /// not the specified item itself when an `impl` refines the
+    /// specification of a trait: there the trait's parameters (notably
+    /// `Self`) become the implementing type, and the specification body is
+    /// instantiated accordingly.
+    Spec {
+        context: DefId,
+        /// How the arguments are supplied, which decides whether their
+        /// snapshots are deep (see `Enc::impure_context`).
+        mode: MirSpecEncMode,
+    },
     Pure,
     Constant(mir::Promoted),
-}
-
-impl PureKind {
-    fn extern_spec(&self) -> Option<ExternSpecKind> {
-        match self {
-            PureKind::Spec(Some(kind)) => Some(*kind),
-            _ => None,
-        }
-    }
+    SpecBlock(mir::BasicBlock),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -92,10 +92,10 @@ pub struct MirPureEncTask<'vir> {
     //   can we integrate the lazy context into the identifier system?
     pub encoding_depth: usize,
     pub kind: PureKind,
-    pub parent_def_id: DefId,             // ID of the function
-    pub param_env: ty::ParamEnv<'vir>,    // param environment at the usage site
-    pub substs: ty::GenericArgsRef<'vir>, // type substitutions at the usage site
-    pub caller_def_id: Option<DefId>,     // ID of the caller function, if any
+    pub parent_def_id: DefId, // ID of the function
+    /// The generic arguments the body is encoded with, together with the
+    /// context whose parameters give them meaning.
+    pub gargs: GArgs<'vir>,
 }
 
 impl TaskEncoder for MirPureEnc {
@@ -105,11 +105,10 @@ impl TaskEncoder for MirPureEnc {
     type TaskDescription<'vir> = MirPureEncTask<'vir>;
 
     type TaskKey<'vir> = (
-        usize,                    // encoding depth
-        PureKind,                 // encoding a pure function?
-        DefId,                    // ID of the function
-        ty::GenericArgsRef<'vir>, // ? this should be the "signature", after applying the env/substs
-        Option<DefId>,            // Caller/Use DefID
+        usize,       // encoding depth
+        PureKind,    // encoding a pure function?
+        DefId,       // ID of the function
+        GArgs<'vir>, // the generic arguments and their context
     );
 
     type OutputFullDependency<'vir> = MirPureEncOutput<'vir>;
@@ -122,8 +121,7 @@ impl TaskEncoder for MirPureEnc {
             task.encoding_depth,
             task.kind,
             task.parent_def_id,
-            task.substs,
-            task.caller_def_id,
+            task.gargs,
         )
     }
 
@@ -133,25 +131,57 @@ impl TaskEncoder for MirPureEnc {
     ) -> EncodeFullResult<'vir, Self> {
         deps.emit_output_ref(*task_key, ())?;
 
-        let (_, kind, def_id, substs, caller_def_id) = *task_key;
+        let (_, kind, def_id, gargs) = *task_key;
 
         tracing::debug!("encoding {def_id:?}");
-        let expr = vir::with_vcx(move |vcx| {
+        let (inputs, expr) = vir::with_vcx(move |vcx| {
+            // The bodies are encoded generically, so they are fetched at the
+            // compiler's identity arguments. The one exception is a trait's
+            // specification encoded for an `impl` of that trait, which is
+            // instantiated with the arguments of the encoding.
+            let identity = ty::GenericArgs::identity_for_item(vcx.tcx(), def_id);
             let body = match kind {
-                PureKind::Closure => vcx
-                    .body_mut()
-                    .get_closure_body(def_id, substs, caller_def_id),
-                PureKind::Spec(_) => vcx.body_mut().get_spec_body(def_id, substs, caller_def_id),
-                PureKind::Pure => vcx
-                    .body_mut()
-                    .get_pure_fn_body(def_id, substs, caller_def_id),
+                PureKind::Closure => vcx.body_mut().get_closure_body(def_id, identity, None),
+                PureKind::Spec { context, .. } => {
+                    let substs = vcx.tcx().mk_args(gargs.args());
+                    vcx.body_mut().get_spec_body(def_id, substs, Some(context))
+                }
+                PureKind::Pure => crate::encoders::pure_body(def_id),
                 PureKind::Constant(promoted) => {
                     vcx.body_mut().get_promoted_constant_body(def_id, promoted)
                 }
+                PureKind::SpecBlock(_) => crate::encoders::impure_body(def_id)
+                    .unwrap_or_else(|| panic!("no body to encode for {def_id:?}")),
             };
 
-            let expr_inner = Enc::new(vcx, task_key.0, def_id, caller_def_id, kind, &body, deps)
-                .encode_body()?;
+            // Encode under the body's span: expression nodes pick up the
+            // ambient span at creation, so everything in a pure/spec body
+            // defaults to the body's source (e.g. the spec attribute for a
+            // spec closure), refined per statement in `encode_stmt`. This is
+            // what error positions inside the body backtranslate to. The MIR
+            // span of a body deserialized from another crate is dummy; the
+            // definition's span survives in the crate metadata.
+            let body_span = if body.span.is_dummy() {
+                vcx.tcx().def_span(def_id)
+            } else {
+                body.span
+            };
+            let mut enc = Enc::new(vcx, task_key.0, def_id, kind, gargs, &body, deps);
+            let expr_inner = vcx.with_span(body_span, |_| {
+                if let PureKind::SpecBlock(block) = kind {
+                    enc.encode_spec_block(block)
+                } else {
+                    enc.encode_body()
+                }
+            })?;
+            let inputs = std::mem::take(&mut enc.versions_used)
+                .into_iter()
+                .filter(|(l, v)| *l != mir::RETURN_PLACE && *v == 0)
+                .map(|(l, _v)| l)
+                .unique()
+                .sorted()
+                .collect::<Vec<_>>();
+            let inputs_expected = inputs.len();
 
             match expr_inner {
                 MirPureEncOutput::MirPureEncOutputExpr(expr_inner) => {
@@ -256,21 +286,27 @@ struct Enc<'vir: 'enc, 'enc> {
     context: GParams<'vir>,
     body: &'enc mir::Body<'vir>,
     rev_doms: rev_doms::ReverseDominators,
+    /// The `ghost!` blocks of the body (the same detection the impure
+    /// encoder uses, via `SpecBlocks`).
+    ghost: GhostBlocks,
     deps: &'enc mut TaskEncoderDependencies<'vir, MirPureEnc>,
     /// Always holds the next version to be used for a local.
     version_ctr: IndexVec<mir::Local, usize>,
+    versions_used: FxHashSet<(mir::Local, usize)>, // TODO: mode indicators?
     phi_ctr: usize,
     old_mode: bool,
     rel0_mode: bool,
     rel1_mode: bool,
     before_expiry_mode: bool,
-    local_defs: MirLocalDefEncOutput<'vir>,
     impure_context: bool,
 }
 
 struct EncodedPlace<'vir> {
     snap: ExprRet<'vir>,
     place_ref: Option<ExprRetRef<'vir>>,
+    /// The metadata for the pointed-to value. Set when going through a
+    /// `ProjectionElem::Deref`.
+    metadata: Option<ExprRet<'vir>>,
 }
 
 impl<'vir> EncodedPlace<'vir> {
@@ -278,17 +314,24 @@ impl<'vir> EncodedPlace<'vir> {
         Self {
             snap: expr,
             place_ref,
+            metadata: None,
         }
+    }
+
+    fn with_metadata(mut self, metadata: ExprRet<'vir>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 }
 
 impl<'vir: 'enc, 'enc> PureRvalueEnc<'vir> for Enc<'vir, 'enc> {
     type Encoder = MirPureEnc;
     type EncodePlaceCtxt = FxHashMap<mir::Local, Version<'vir>>;
+    const PURE: bool = true;
     type ExprCurr = ExprInput<'vir>;
     type ExprNext = vir::ExprKind<'vir>;
-    fn def_id(&self) -> DefId {
-        self.def_id
+    fn context(&self) -> GParams<'vir> {
+        self.context
     }
     fn deps(&mut self) -> &mut TaskEncoderDependencies<'vir, Self::Encoder> {
         self.deps
@@ -307,22 +350,23 @@ impl<'vir: 'enc, 'enc> PureRvalueEnc<'vir> for Enc<'vir, 'enc> {
         &mut self,
         place: Place<'vir>,
         curr_ver: &Self::EncodePlaceCtxt,
-    ) -> ExprRet<'vir> {
-        self.encode_place_with_ref(curr_ver, place).snap
+    ) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
+        Ok(self.encode_place_with_ref(curr_ver, place)?.snap)
     }
 
     fn encode_operand_snap(
         &mut self,
         operand: &mir::Operand<'vir>,
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
-    ) -> Result<ExprRet<'vir>, EncodeFullError<'vir, Self::Encoder>> {
+    ) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
         Ok(match operand {
             mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-                self.encode_place_snap((*place).into(), curr_ver)
+                self.encode_place_snap((*place).into(), curr_ver)?
             }
             mir::Operand::Constant(box constant) => {
                 self.encode_constant_snap(constant)?.upcast_ty().lift()
             }
+            mir::Operand::RuntimeChecks(_) => todo!(),
         })
     }
 }
@@ -349,59 +393,46 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         vcx: &'vir vir::VirCtxt<'vir>,
         encoding_depth: usize,
         def_id: DefId,
-        caller_def_id: Option<DefId>,
         kind: PureKind,
+        gargs: GArgs<'vir>,
         body: &'enc mir::Body<'vir>,
         deps: &'enc mut TaskEncoderDependencies<'vir, MirPureEnc>,
     ) -> Self {
-        assert!(
-            !graph::is_cyclic(&body.basic_blocks),
-            "MIR pure encoding does not support loops"
-        );
         let rev_doms = rev_doms::ReverseDominators::new(&body.basic_blocks);
-        let local_def_enc_task = if kind.extern_spec().is_some() {
-            MirLocalDefEncTask::ExternSpec(def_id)
-        } else {
-            MirLocalDefEncTask::Local {
-                def_id,
-                all_locals: true,
-            }
-        };
-        let local_defs = deps
-            .require_dep::<MirLocalDefEnc>(local_def_enc_task)
-            .unwrap();
         Self {
             vcx,
             encoding_depth,
             def_id,
-            context: GParams::new_maybe_extern(caller_def_id.unwrap_or(def_id), kind.extern_spec()),
+            context: gargs.context(),
             body,
             rev_doms,
+            ghost: GhostBlocks::new(def_id, body),
             deps,
             // visited: IndexVec::from_elem_n(false, body.basic_blocks.len()),
             version_ctr: IndexVec::from_elem_n(0, body.local_decls.len()),
+            versions_used: Default::default(),
             phi_ctr: 0,
             old_mode: false,
             rel0_mode: false,
             rel1_mode: false,
             before_expiry_mode: false,
-            local_defs,
-            impure_context: matches!(kind, PureKind::Spec(_)),
+            // An impure method's specs and contained spec blocks get shallow
+            // argument snapshots (and can take a snapshot of the predicates
+            // behind `&mut`s). Pure functions currently also only get shallow
+            // snapshots but cannot get the value behind `&mut`s.
+            impure_context: matches!(
+                kind,
+                PureKind::Spec {
+                    mode: MirSpecEncMode::Impure,
+                    ..
+                } | PureKind::SpecBlock(..)
+            ),
         }
     }
 
     fn ty_use(&mut self, ty: ty::Ty<'vir>) -> TyUsePure<'vir> {
         let ty_task = RustTyDecomposition::from_ty(ty, self.context);
         self.deps.require_dep::<TyUsePureEnc>(ty_task).unwrap()
-    }
-
-    fn ty_use_real(&mut self) -> &'vir TyRealLocal<'vir> {
-        let ty_task = RustTyDecomposition::from_real();
-        self.deps
-            .require_dep::<TyUsePureEnc>(ty_task)
-            .unwrap()
-            .expect_builtin()
-            .expect_real()
     }
 
     fn get_ty_for_local(&mut self, local: mir::Local) -> vir::TypeSnap<'vir> {
@@ -442,6 +473,34 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         expr: ExprRet<'vir>,
         location: mir::Location,
     ) {
+        if self.version_ctr[local] == 0 {
+            // Version 0 signifies "inputs into the expression", as checked in
+            // `do_encode_full` to figure out which locals should be encoded
+            // and provided by the caller/user of the encoded expression. In
+            // most cases, version 0 is not assigned to for non-input locals,
+            // because a preceding `StorageLive` bumps the version before the
+            // assignment takes place, and so any later reads of that local use
+            // at least version 1. However, there are some operations, such as
+            // checked binary operations, that do not cause the compiler to
+            // emit a `StorageLive` for their target place. This workaround
+            // checks for such a case and bumps the version twice.
+            //
+            // see: https://github.com/rust-lang/rust/issues/67400
+            self.bump_version_no_assign(local, location);
+        }
+
+        let new_version = self.bump_version_no_assign(local, location);
+        // check that `local` and `expr` type correspond
+        update.assign(self.vcx, self.encoding_depth, local, new_version, expr);
+    }
+
+    fn bump_version_init(
+        &mut self,
+        update: &mut Update<'vir>,
+        local: mir::Local,
+        expr: ExprRet<'vir>,
+        location: mir::Location,
+    ) {
         let new_version = self.bump_version_no_assign(local, location);
         // check that `local` and `expr` type correspond
         update.assign(self.vcx, self.encoding_depth, local, new_version, expr);
@@ -467,9 +526,16 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         expr: ExprRetAny<'vir, T>,
     ) -> ExprRetAny<'vir, T> {
         update.binds.iter().rfold(expr, |expr, bind| match bind {
-            UpdateBind::Local(_, version, val) => {
-                let decl = version.initialised.unwrap();
-                self.vcx.mk_let_expr(decl, val, expr)
+            UpdateBind::Local(local, version, val) => {
+                // skip bindings which were not used
+                // TODO: this might optimise away some function calls which
+                //   can act as triggers for quantifiers
+                if !self.versions_used.contains(&(*local, version.index)) {
+                    expr
+                } else {
+                    let decl = version.initialised.unwrap();
+                    self.vcx.mk_let_expr(decl, val, expr)
+                }
             }
             UpdateBind::Phi(version, val) => {
                 self.vcx
@@ -515,17 +581,17 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         let v0 = Version::default();
         // TODO: what about locals which never have StorageLive (i.e. always_live)?
         init.versions.insert(mir::RETURN_PLACE, v0);
-        for local in 1..=self.body.arg_count {
+        for local in 1..local_count {
             let local_ex = self.vcx.mk_lazy_expr(
                 vir::vir_format!(self.vcx, "pure in _{local}"),
                 self.get_ty_for_local(local.into()),
-                Box::new(move |_vcx, lctx: ExprInput<'vir>| lctx.1[local - 1].kind),
+                Box::new(move |_vcx, lctx: ExprInput<'vir>| lctx.1[&local.into()].kind),
             );
             // check that `local` and `expr` type correspond
-            self.bump_version(&mut init, local.into(), local_ex, v0.location);
+            self.bump_version_init(&mut init, local.into(), local_ex, v0.location);
         }
 
-        let update = self.encode_cfg(&init.versions, mir::START_BLOCK, self.rev_doms.end)?;
+        let update = self.encode_cfg(&init.versions, start, end)?;
 
         if let Some(EncodeCfgRes::EncodeCfgResPred(pred, update)) = update {
             let res = init
@@ -546,6 +612,39 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 self.reify_binds(res, ex),
             ))
         }
+    }
+
+    fn encode_body(&mut self) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
+        assert!(
+            !graph::is_cyclic(&self.body.basic_blocks),
+            "MIR pure encoding does not support loops"
+        );
+        self.encode_common(
+            mir::START_BLOCK,
+            self.rev_doms.end,
+            self.body.arg_count + 1,
+            mir::RETURN_PLACE,
+        )
+    }
+
+    fn encode_spec_block(
+        &mut self,
+        block: mir::BasicBlock,
+    ) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
+        let Some(mir::TerminatorKind::Call { destination, .. }) = self.body.basic_blocks[block]
+            .terminator
+            .as_ref()
+            .map(|t| &t.kind)
+        else {
+            unreachable!("malformed spec-only block: should end in a call terminator");
+        };
+        assert!(destination.projection.is_empty());
+        self.encode_common(
+            block,
+            self.body.basic_blocks.successors(block).next().unwrap(),
+            self.body.local_decls.len(),
+            destination.local,
+        )
     }
 
     fn encode_cfg(
@@ -595,6 +694,15 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             }
 
             mir::TerminatorKind::SwitchInt { discr, targets } => {
+                // A `ghost!` block's `if false` switch: continue straight
+                // into the ghost arm (the inline ghost body); the runtime
+                // `ghost_erased` stand-in arm is skipped.
+                if let Some(ghost) = self.ghost.switches.get(&curr) {
+                    let rest_update =
+                        self.encode_cfg(&new_curr_ver, ghost.arm_block, join_point)?;
+                    return Ok(stmt_update.merge(rest_update));
+                }
+
                 // encode the discriminant operand
                 let discr_expr = self
                     .encode_operand_snap(discr, &new_curr_ver)?
@@ -637,6 +745,20 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     .map(|l| self.body.local_decls[*l].ty)
                     .collect();
 
+                // for each branch, mark the updated versions as "used"
+                // TODO: this is an over-estimation: the variable after the
+                //   join point may not actually be used
+                for update in &updates {
+                    let Some(update) = update else {
+                        continue;
+                    };
+                    for local in &mod_locals {
+                        if let Some(version) = update.versions.get(local) {
+                            self.versions_used.insert((*local, version.index));
+                        }
+                    }
+                }
+
                 // for each branch, create a Viper tuple of the updated locals
                 let tuple_ref = self
                     .deps
@@ -648,7 +770,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     |expr, ((cond_val, _target), branch_update)| {
                         self.vcx.mk_ternary_expr(
                             self.vcx.mk_eq_expr(
-                                discr_ty_out.expect_native().snap_to_prim.call()(discr_expr),
+                                discr_ty_out.snap_to_prim(discr_expr),
                                 discr_ty_out.expr_from_bits(discr_ty, cond_val).lift(),
                             ),
                             self.reify_branch(
@@ -704,9 +826,10 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             } => {
                 // encode the condition operand
                 let cond_ty = cond.ty(self.body, self.vcx.tcx());
-                assert_eq!(*cond_ty.kind(), ty::TyKind::Bool);
-                let cond_expr = self.encode_operand_snap(cond, &new_curr_ver)?.downcast_ty();
-                let cond_ty_out = self.ty_use(cond_ty).expect_primitive();
+                assert_eq!(*cond_ty.kind(), TyKind::Bool);
+                let cond_expr = self
+                    .encode_operand_snap(cond, &new_curr_ver)?
+                    .downcast_ty::<vir::Bool>();
 
                 // if cond == expected: walk the rest of the CFG
                 let ok_update = self.encode_cfg(&new_curr_ver, *target, join_point)?;
@@ -804,28 +927,37 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     // A fn call in pure can only be one of two kinds: a
                     // call to another pure function, or a call to a prusti
                     // builtin function.
-                    let is_pure = crate::encoders::with_proc_spec(
-                        SpecQuery::GetProcKind(
-                            def_id,
-                            ty::List::identity_for_item(self.vcx.tcx(), def_id),
-                        ),
-                        |def_spec| def_spec.kind.is_pure().unwrap_or_default(),
-                    )
-                    .unwrap_or_default();
+                    let is_pure = crate::encoders::is_function_pure(def_id, self.gargs(arg_tys));
 
-                    let env_query = EnvQuery::new(self.vcx.tcx());
-                    if env_query.is_function_in_crate(def_id, arg_tys, "prusti_contracts") {
-                        let sig = self.vcx.tcx().fn_sig(def_id);
-                        let sig = sig.instantiate_identity();
-                        let actual_impl = env_query.find_impl_of_trait_method_call(def_id, arg_tys);
-                        self.encode_prusti_builtin(
+                    // The bodiless `ptr_metadata` intrinsic is only lowered to
+                    // `UnOp::PtrMetadata` in optimized MIR; do the lowering here.
+                    let intrinsic = self.vcx.tcx().intrinsic(def_id);
+                    let intrinsic = intrinsic.and_then(RustcIntrinsic::from_intrinsic);
+                    if let Some(intrinsic) = intrinsic {
+                        self.encode_intrinsic(intrinsic, arg_tys, args, &new_curr_ver)
+                    } else if let Some(builtin) = PrustiBuiltin::new(def_id, self.gargs(arg_tys)) {
+                        match self.encode_prusti_builtin(
+                            builtin,
                             def_id,
-                            actual_impl,
-                            sig,
-                            arg_tys,
+                            self.gargs(arg_tys),
                             args,
+                            term.source_info.span,
                             &new_curr_ver,
-                        )
+                        )? {
+                            Some(expr) => Ok(expr),
+                            // The pure-only builtins (quantifiers, spec blocks,
+                            // mode markers).
+                            None => {
+                                let PrustiBuiltin::Spec(builtin) = builtin else {
+                                    // Operand-based builtins are handled by
+                                    // `PureRvalueEnc::encode_prusti_builtin` before this is reached.
+                                    unreachable!(
+                                        "operand-based builtin in the pure-only handler: {builtin:?}"
+                                    )
+                                };
+                                self.encode_pure_only_builtin(builtin, arg_tys, args, &new_curr_ver)
+                            }
+                        }
                     } else if is_pure {
                         let pure_func = self
                             .deps
@@ -888,26 +1020,36 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
         stmt: &mir::Statement<'vir>,
         location: mir::Location,
-    ) -> Result<Update<'vir>, EncodeFullError<'vir, MirPureEnc>> {
-        let mut update = Update::new();
-        match &stmt.kind {
-            &mir::StatementKind::StorageLive(local) => {
-                let new_version = self.bump_version_no_assign(local, location);
-                update.versions.insert(local, new_version);
+    ) -> EncodeResult<'vir, Update<'vir>, MirPureEnc> {
+        // Encoded under the statement's span: expressions pick up the ambient
+        // span at creation, which makes error positions inside pure/spec
+        // bodies point at the originating source (e.g. the failing conjunct
+        // of a spec).
+        self.vcx.with_span(stmt.source_info.span, |_| {
+            let mut update = Update::new();
+            match &stmt.kind {
+                &mir::StatementKind::StorageLive(local) => {
+                    let new_version = self.bump_version_no_assign(local, location);
+                    update.versions.insert(local, new_version);
+                }
+                mir::StatementKind::StorageDead(..)
+                | mir::StatementKind::FakeRead(..)
+                | mir::StatementKind::AscribeUserType(..)
+                | mir::StatementKind::PlaceMention(..)
+                | mir::StatementKind::Coverage(..)
+                | mir::StatementKind::ConstEvalCounter
+                | mir::StatementKind::Nop
+                | mir::StatementKind::BackwardIncompatibleDropHint { .. } => {} // nop
+                mir::StatementKind::Assign(box (dest, rvalue)) => {
+                    //assert!(dest.projection.is_empty());
+                    let span = stmt.source_info.span;
+                    let expr = self.encode_rvalue(curr_ver, rvalue, span)?;
+                    self.bump_version(&mut update, dest.local, expr, location);
+                }
+                k => todo!("statement kind {k:?}"),
             }
-            mir::StatementKind::StorageDead(..)
-            | mir::StatementKind::FakeRead(..)
-            | mir::StatementKind::AscribeUserType(..)
-            | mir::StatementKind::PlaceMention(..) => {} // nop
-            mir::StatementKind::Assign(box (dest, rvalue)) => {
-                //assert!(dest.projection.is_empty());
-                let span = stmt.source_info.span;
-                let expr = self.encode_rvalue(curr_ver, rvalue, span)?;
-                self.bump_version(&mut update, dest.local, expr, location);
-            }
-            k => todo!("statement kind {k:?}"),
-        }
-        Ok(update)
+            Ok(update)
+        })
     }
 
     fn encode_offsetof(
@@ -944,7 +1086,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
         rvalue: &mir::Rvalue<'vir>,
         span: Span,
-    ) -> Result<ExprRet<'vir>, EncodeFullError<'vir, MirPureEnc>> {
+    ) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
         let rvalue_ty = rvalue.ty(self.body, self.vcx.tcx());
         match rvalue {
             mir::Rvalue::NullaryOp(mir::NullOp::OffsetOf(lst), ty) => {
@@ -953,33 +1095,42 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             mir::Rvalue::Use(op) => self.encode_operand_snap(op, curr_ver),
             mir::Rvalue::Ref(_, kind, place) => {
                 let rvalue_snapshot_encoding = self.ty_use(rvalue_ty);
-                let encoded_place = self.encode_place_with_ref(curr_ver, (*place).into());
+                // Reading a mutable reference's referent needs an address
+                // holding a predicate, which pure-created mutrefs don't have.
                 if kind.mutability().is_mut() {
+                    return Err(self.unsupported_rvalue(
+                        format!(
+                            "mutable borrow of `{}` in a specification: take a shared \
+                             reference (`&`) instead",
+                            place.ty(self.body, self.vcx.tcx()).ty
+                        ),
+                        self.current_span(),
+                    ));
+                }
+                let encoded_place = self.encode_place_with_ref(curr_ver, (*place).into())?;
+                // We want to distinguish if `place` is a value that lives
+                // in pure code or not. If it lives in impure (the only way
+                // that this can happen is that we have a `&mut` argument)
+                // then we want to return the actual address in the
+                // snapshot. Otherwise we want to use `null` as this value
+                // should never escape pure code anyway. Thus `place_ref`
+                // will return `None` if this isn't a re-borrow, and if it's
+                // a re-borrow of created-in-pure reference then it will be
+                // field projections of `null` which is also `null`.
+                let place_ref = encoded_place
+                    .place_ref
+                    .unwrap_or_else(|| self.vcx.mk_null().lazy());
+                let metadata = encoded_place
+                    .metadata
+                    .unwrap_or_else(|| self.expect_thin_ptr_metadata(rvalue_ty));
+                let snap = if kind.mutability().is_mut() {
                     let e_rvalue_ty = rvalue_snapshot_encoding.expect_mutref();
-                    // We want to distinguish if `place` is a value that lives
-                    // in pure code or not. If it lives in impure (the only way
-                    // that this can happen is that we have a `&mut` argument)
-                    // then we want to return the actual address in the
-                    // snapshot. Otherwise we want to use `null` as this value
-                    // should never escape pure code anyway. Thus `place_ref`
-                    // will return `None` if this isn't a re-borrow, and if it's
-                    // a re-borrow of created-in-pure reference then it will be
-                    // field projections of `null` which is also `null`.
-                    let place_ref = encoded_place
-                        .place_ref
-                        .unwrap_or_else(|| self.vcx.mk_null().lazy());
-                    Ok(e_rvalue_ty
-                        .prim_to_snap(place_ref, encoded_place.snap)
-                        .upcast_ty())
+                    e_rvalue_ty.prim_to_snap(place_ref, metadata, encoded_place.snap)
                 } else {
                     let e_rvalue_ty = rvalue_snapshot_encoding.expect_immref();
-                    // For shared borrows we want to use just the snapshot
-                    // without the reference so that snapshot equality compares
-                    // only values.
-                    Ok(e_rvalue_ty
-                        .prim_to_snap(self.vcx.mk_null().lazy(), encoded_place.snap)
-                        .upcast_ty())
-                }
+                    e_rvalue_ty.prim_to_snap(place_ref, metadata, encoded_place.snap)
+                };
+                Ok(snap.upcast_ty())
             }
             mir::Rvalue::RawPtr(kind, place) if !kind.is_fake() => {
                 let rvalue_snapshot_encoding = self.ty_use(rvalue_ty);
@@ -991,7 +1142,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 Ok(e_rvalue_ty.prim_to_snap(place_ref).upcast_ty())
             }
             mir::Rvalue::BinaryOp(op, box (l, r)) => {
-                self.encode_binop_snap(rvalue_ty, *op, l, r, curr_ver)
+                self.encode_binop_snap(rvalue_ty, *op, l, r, curr_ver, span)
             }
             mir::Rvalue::UnaryOp(unop, operand) => {
                 self.encode_unary_op_snap(rvalue_ty, *unop, operand, curr_ver)
@@ -1010,29 +1161,43 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     .filter(|_| place_ty.variant_index.is_none())
                 {
                     Some(ty) => ty.snap_to_discr_snap(
-                        self.encode_place_snap((*place).into(), curr_ver)
+                        self.encode_place_snap((*place).into(), curr_ver)?
                             .downcast_ty(),
                     ),
                     None => {
                         let e_rvalue_ty = self.ty_use(rvalue_ty).expect_primitive();
                         // mir::Rvalue::Discriminant documents "Returns zero for types without discriminant"
                         let zero = self.vcx.mk_uint::<0>();
-                        e_rvalue_ty.prim_to_snap.call()(zero.upcast_ty()).lift()
+                        e_rvalue_ty.prim_to_snap(zero.upcast_ty()).lift()
                     }
                 };
                 Ok(discr.upcast_ty())
             }
             mir::Rvalue::Cast(kind, operand, ty) => {
-                Ok(self.encode_cast_snap(*kind, operand, *ty, curr_ver)?.expr)
+                assert_eq!(*ty, rvalue_ty);
+                Ok(self
+                    .encode_cast_snap(rvalue_ty, *kind, operand, curr_ver)?
+                    .1)
             }
-            mir::Rvalue::Len(place) => Ok(self.encode_len_snap((*place).into(), curr_ver)),
-            _ => self.vcx.with_span(span, |vcx| {
-                let error_msg = format!("unsupported rvalue {rvalue:?} might be reached");
-                vcx.handle_error("application.precondition:assertion.false", move |_| {
-                    Some(vec![PrustiError::verification(&error_msg, span.into())])
-                });
-                Ok(self.ty_use(rvalue_ty).unreachable_to_snap())
-            }),
+            mir::Rvalue::RawPtr(_, place) => {
+                let encoded_place = self.encode_place_with_ref(curr_ver, (*place).into())?;
+                // As for `Rvalue::Ref`: a raw pointer built in pure code never
+                // escapes, so its address is `null` unless it re-borrows the
+                // place of an impure `&mut` argument.
+                let place_ref = encoded_place
+                    .place_ref
+                    .unwrap_or_else(|| self.vcx.mk_null().lazy());
+                let metadata = encoded_place
+                    .metadata
+                    .unwrap_or_else(|| self.expect_thin_ptr_metadata(rvalue_ty));
+                let raw_ty = self.ty_use(rvalue_ty);
+                Ok(raw_ty
+                    .expect_raw()
+                    .prim_to_snap(place_ref, metadata)
+                    .upcast_ty())
+            }
+            _ => Err(self
+                .unsupported_rvalue(format!("unsupported rvalue {rvalue:?} in pure code"), span)),
         }
     }
 
@@ -1042,49 +1207,77 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         place_ty: mir::PlaceTy<'vir>,
         elem: mir::PlaceElem<'vir>,
         encoded_place: EncodedPlace<'vir>,
-    ) -> EncodedPlace<'vir> {
+    ) -> EncodeResult<'vir, EncodedPlace<'vir>, MirPureEnc> {
         let e_ty = self.ty_use(place_ty.ty);
-        match elem {
+        Ok(match elem {
             mir::ProjectionElem::Deref => {
                 assert!(place_ty.variant_index.is_none());
                 match place_ty.ty.kind() {
                     TyKind::Adt(adt, _) if adt.is_box() => {
-                        let proj =
-                            e_ty.expect_variant_opt(place_ty.variant_index)[abi::FieldIdx::ZERO];
-                        let proj_app = proj.read(encoded_place.snap.downcast_ty());
-                        let place_ref = encoded_place.place_ref.map(|pr| proj.field_ref(pr));
-                        EncodedPlace::new(proj_app, place_ref)
+                        // The boxed value, its address and its pointer metadata
+                        // are all read out of the snapshot.
+                        let data = e_ty.expect_structlike();
+                        let snap = encoded_place.snap.downcast_ty();
+                        let val_expr = data.box_value_access(snap);
+                        let place_ref = Some(data.box_address_access(snap));
+                        let metadata = data.box_metadata_access(snap);
+                        EncodedPlace::new(val_expr, place_ref).with_metadata(metadata)
                     }
                     TyKind::Ref(.., ty::Mutability::Not) => {
                         let e_ty = e_ty.expect_immref();
-                        let val_expr = e_ty.value_access(encoded_place.snap.downcast_ty());
-                        EncodedPlace::new(val_expr, encoded_place.place_ref)
+                        let snap = encoded_place.snap.downcast_ty();
+                        let metadata = e_ty.metadata_access(snap);
+                        let val_expr = e_ty.value_access(snap);
+                        let ref_expr = e_ty.addr_access(snap);
+                        EncodedPlace::new(val_expr, Some(ref_expr)).with_metadata(metadata)
                     }
                     TyKind::Ref(.., ty::Mutability::Mut) => {
-                        assert!(
-                            self.impure_context,
-                            "mutable deref is not allowed in a pure context (e.g. pure functions)"
-                        );
                         let e_ty = e_ty.expect_mutref();
-                        let val_expr = e_ty.deref_access(encoded_place.snap.downcast_ty());
-                        // TODO: avoid all of this by using shallow and deep snapshots
-                        let ty_task = RustTyDecomposition::from_ty(place_ty.ty, self.context);
-                        let inner = ty_task.ty.expect_mutref();
-                        let normalized =
-                            inner.decompose_compare_normalize(ty_task.ty.params, ty_task.args);
-                        let caster = self
-                            .deps
-                            .require_dep::<crate::GArgsCastEnc<crate::Pure>>(normalized)
-                            .unwrap();
-                        let inner_ty_task =
-                            inner.decompose_context(ty_task.ty.params, ty_task.args);
-                        let inner_ty = self
-                            .deps
-                            .require_dep::<crate::encoders::TyUseImpureEnc>(inner_ty_task)
-                            .unwrap();
-                        let val_expr = inner_ty.ref_to_snap(val_expr);
-                        let val_expr = caster.cast_to_caller_ctx(val_expr);
-                        EncodedPlace::new(val_expr, encoded_place.place_ref)
+                        let snap = encoded_place.snap.downcast_ty();
+                        let metadata = e_ty.metadata_access(snap);
+                        let ref_expr = e_ty.deref_access(snap);
+                        if !self.impure_context {
+                            // The value field of a mutable reference's snapshot
+                            // is never constrained to the referent (see
+                            // `p_Ref_mutable_arbitrary_value`).
+                            return Err(self.unsupported_rvalue(
+                                format!(
+                                    "dereference of the mutable reference `{}` in pure code",
+                                    place_ty.ty
+                                ),
+                                self.current_span(),
+                            ));
+                        }
+                        let val_expr = {
+                            // The snapshot is shallow and doesn't contain the
+                            // value behind the mutable reference, so we need to
+                            // take an extra snapshot here.
+                            // TODO: avoid all of this by using shallow and deep snapshots
+                            let ty_task = RustTyDecomposition::from_ty(place_ty.ty, self.context);
+                            let inner = ty_task.ty.expect_mutref();
+                            let normalized = inner
+                                .referent
+                                .decompose_compare_normalize(ty_task.ty.params, ty_task.args);
+                            let caster = self
+                                .deps
+                                .require_dep::<crate::GArgsCastEnc<crate::Pure>>(normalized)
+                                .unwrap();
+                            let inner_ty_task = inner
+                                .referent
+                                .decompose_context(ty_task.ty.params, ty_task.args);
+                            let inner_ty = self
+                                .deps
+                                .require_dep::<crate::encoders::TyUseImpureEnc>(inner_ty_task)
+                                .unwrap();
+                            caster.cast_to_caller_ctx(inner_ty.ref_to_snap(ref_expr))
+                        };
+                        EncodedPlace::new(val_expr, Some(ref_expr)).with_metadata(metadata)
+                    }
+                    TyKind::RawPtr(..) => {
+                        return Err(self.unsupported_rvalue(
+                            format!("dereference of the raw pointer `{}`", place_ty.ty),
+                            self.current_span(),
+                        ));
                     }
                     TyKind::RawPtr(inner_ty, _) => {
                         let ty_task = RustTyDecomposition::from_ty(place_ty.ty, self.context);
@@ -1103,24 +1296,52 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     _ => unreachable!(),
                 }
             }
-            mir::ProjectionElem::Field(field_idx, _ty) => {
-                let proj = e_ty.expect_variant_opt(place_ty.variant_index)[field_idx];
+            mir::ProjectionElem::Field(field_idx, _) => {
+                let variant = e_ty.expect_variant_opt(place_ty.variant_index);
+                let proj = variant[field_idx];
                 let proj_app = proj.read(encoded_place.snap.downcast_ty());
                 let place_ref = encoded_place.place_ref.map(|pr| proj.field_ref(pr));
-                EncodedPlace::new(proj_app, place_ref)
+                let place = EncodedPlace::new(proj_app, place_ref);
+                // Only the last field can be an unsized DST tail that shares the
+                // containing value's pointer metadata; propagate it there, and
+                // nowhere else (every other field is sized and thin).
+                let is_last_field = field_idx.index() + 1 == variant.fields.len();
+                match encoded_place.metadata {
+                    Some(metadata) if is_last_field => place.with_metadata(metadata),
+                    _ => place,
+                }
             }
             mir::ProjectionElem::Index(idx) => {
                 let proj = e_ty.expect_array();
                 let idx = self
-                    .encode_place_with_ref(curr_ver, mir::Place::from(idx).into())
+                    .encode_place_with_ref(curr_ver, mir::Place::from(idx).into())?
                     .snap;
                 let usize_ty = self.ty_use(self.vcx.tcx().types.usize);
                 let idx = usize_ty
                     .expect_primitive()
-                    .expect_native()
-                    .snap_to_prim
-                    .call()(idx.downcast_ty())
-                .downcast_ty();
+                    .snap_to_prim(idx.downcast_ty())
+                    .downcast_ty();
+                let proj_app = proj.index(encoded_place.snap.downcast_ty(), idx);
+                let place_ref = encoded_place
+                    .place_ref
+                    .map(|pr| proj.ref_to_index_ref(pr, idx));
+                EncodedPlace::new(proj_app, place_ref)
+            }
+            // `from_end` indexes from the runtime length of a slice; it is
+            // always false for an array, whose statically known length lets
+            // the compiler resolve the offset. Only the array form is
+            // supported (a slice is matched behind a reference and its
+            // length is not in the snapshot's type).
+            mir::ProjectionElem::ConstantIndex {
+                offset,
+                from_end: false,
+                ..
+            } => {
+                let proj = e_ty.expect_array();
+                let idx = self
+                    .vcx
+                    .mk_const_expr(vir::ConstData::Int(offset as u128))
+                    .downcast_ty();
                 let proj_app = proj.index(encoded_place.snap.downcast_ty(), idx);
                 let place_ref = encoded_place
                     .place_ref
@@ -1129,7 +1350,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             }
             mir::ProjectionElem::Downcast(..) => encoded_place,
             _ => todo!("Unsupported ProjectionElem {:?}", elem),
-        }
+        })
     }
 
     fn in_mode(&self) -> bool {
@@ -1140,9 +1361,11 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         &mut self,
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
         place: Place<'vir>,
-    ) -> EncodedPlace<'vir> {
+    ) -> EncodeResult<'vir, EncodedPlace<'vir>, MirPureEnc> {
         // TODO: remove (debug)
         assert!(curr_ver.contains_key(&place.local));
+        self.versions_used
+            .insert((place.local, curr_ver[&place.local].index));
 
         let mut place_ty = mir::PlaceTy::from_ty(self.body.local_decls[place.local].ty);
 
@@ -1152,45 +1375,67 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         };
 
         let expr = if should_wrap {
-            let local_as_uzize = place.local.as_usize();
             self.vcx.mk_lazy_expr(
-                vir::vir_format!(self.vcx, "wraped in _{}", local_as_uzize),
+                vir::vir_format!(self.vcx, "wrapped in {:?}", place.local),
                 self.get_ty_for_local(place.local),
-                Box::new(move |_vcx, lctx: ExprInput<'vir>| lctx.1[local_as_uzize - 1].kind),
+                Box::new(move |_vcx, lctx: ExprInput<'vir>| lctx.1[&place.local].kind),
             )
         } else {
             self.mk_local_ex(place.local, curr_ver[&place.local])
         };
-        let place_ref: Option<ExprRetRef<'vir>> =
-            Some(self.local_defs[place.local].local_ex.lazy());
-        let mut encoded_place = EncodedPlace::new(expr, place_ref);
+        let mut encoded_place = EncodedPlace::new(expr, None);
         // TODO: factor this out (duplication with impure encoder)?
         for elem in place.projection {
-            encoded_place = self.encode_place_element(curr_ver, place_ty, *elem, encoded_place);
+            // The snapshots of the arguments and the result are pinned to a
+            // state, so the only read of the heap is the dereference of a
+            // mutable reference in an impure context; only that is wrapped.
+            // An `old` around a pinned snapshot is a no-op, but breaks the
+            // match with the callee's wand at a call site, where the `old` is
+            // labelled. Silicon evaluates the heap-independent parts of a wand
+            // when inhaling it, where `old[lhs]` is undefined.
+            let heap_read = should_wrap
+                && self.impure_context
+                && matches!(elem, mir::ProjectionElem::Deref)
+                && matches!(place_ty.ty.kind(), TyKind::Ref(.., ty::Mutability::Mut));
+            encoded_place = self.encode_place_element(curr_ver, place_ty, *elem, encoded_place)?;
             place_ty = place_ty.projection_ty(self.vcx.tcx(), *elem);
+            if heap_read && self.old_mode {
+                let inner = encoded_place.snap;
+                encoded_place.snap = self.vcx.mk_lazy_expr(
+                    "old_mode_wrap",
+                    inner.ty(),
+                    Box::new(move |vcx, lctx: ExprInput<'vir>| {
+                        use vir::Reify;
+                        let reified = inner.reify(vcx, lctx);
+                        vcx.mk_old(reified, lctx.2).kind
+                    }),
+                );
+            }
+            if heap_read && self.before_expiry_mode {
+                encoded_place.snap = self.vcx.mk_old_lhs_expr(encoded_place.snap);
+            }
         }
         // Can we ever have the use of a projected place?
         assert!(place_ty.variant_index.is_none());
 
         if should_wrap {
-            if self.old_mode {
-                encoded_place.snap = self.vcx.mk_old_expr(encoded_place.snap);
-            }
             if self.rel0_mode {
                 encoded_place.snap = self.vcx.mk_rel_expr(encoded_place.snap, 0);
             }
             if self.rel1_mode {
                 encoded_place.snap = self.vcx.mk_rel_expr(encoded_place.snap, 1);
             }
-            if self.before_expiry_mode {
-                encoded_place.snap = self.vcx.mk_old_lhs_expr(encoded_place.snap);
-            }
         }
 
-        encoded_place
+        Ok(encoded_place)
     }
 
-    fn encode_real_op(
+    /// Encodes the closure argument of a quantifier/spec-block builtin: the
+    /// closure's arguments become the returned quantified variable
+    /// declarations (empty for `spec_block`) and its body the returned,
+    /// recursively encoded expression. `name` is the builtin's
+    /// `prusti_contracts` name, for error reporting.
+    fn encode_spec_closure(
         &mut self,
         bin_op: vir::BinOpKind,
         args: &[Spanned<mir::Operand<'vir>>],
@@ -1231,15 +1476,27 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 .downcast_ty(),
         );
 
-        let a1_ty = args[1].node.ty(self.body, self.vcx.tcx());
-        let real2 = self
-            .encode_operand_snap(&args[1].node, curr_ver)?
-            .downcast_ty();
-        let real2_deref = real.snap_to_perm.call()(
-            self.ty_use(a1_ty)
-                .expect_immref()
-                .value_access(real2)
-                .downcast_ty(),
+        // TODO: recursively invoke MirPure encoder to encode
+        // the body of the closure; pass the closure as the
+        // variable to use, then closure access = tuple access
+        // (then hope to optimise this away later ...?)
+        use vir::Reify;
+        let body = self
+            .deps
+            .require_dep::<MirPureEnc>(MirPureEncTask {
+                encoding_depth: self.encoding_depth + 1,
+                kind: PureKind::Closure,
+                parent_def_id: cl_def_id,
+                gargs: GParams::from(cl_def_id).identity_args(),
+            })?
+            .expr;
+        let reify_args = self.vcx.alloc(reify_args);
+        let body = self.vcx.mk_lazy_expr(
+            vir::vir_format!(self.vcx, "spec closure body ({name})"),
+            body.ty(),
+            Box::new(move |vcx, lctx: ExprInput<'vir>| {
+                body.reify(vcx, (cl_def_id, reify_args, lctx.2)).kind
+            }),
         );
         Ok(MirPureEncOutput::MirPureEncOutputExpr(
             bool.prim_to_snap.call()(
@@ -1251,11 +1508,13 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         ))
     }
 
-    fn encode_prusti_builtin(
+    /// Encodes the pure-only `prusti_contracts` builtins (quantifiers, spec
+    /// blocks, and the old/rel/before-expiry mode markers), which need this
+    /// encoder's own state. The operand-based builtins are handled by the
+    /// shared [`PureRvalueEnc::encode_prusti_builtin`].
+    fn encode_pure_only_builtin(
         &mut self,
-        def_id: DefId,
-        actual_impl: Option<DefId>,
-        _sig: Binder<'vir, FnSig<'vir>>,
+        builtin: SpecBuiltin,
         arg_tys: ty::GenericArgsRef<'vir>,
         args: &[Spanned<mir::Operand<'vir>>],
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
@@ -1384,55 +1643,10 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 //   - expression for the body
                 assert_eq!(encoded_args.len(), 2);
 
-                let closure_ty = arg_tys[2].expect_ty();
-
-                let (qvar_tys, _upvar_tys, cl_kind, cl_def_id) = match closure_ty.kind() {
-                    TyKind::Closure(cl_def_id, cl_args) => (
-                        match cl_args.as_closure().sig().skip_binder().inputs()[0].kind() {
-                            TyKind::Tuple(list) => list,
-                            _ => unreachable!(),
-                        },
-                        cl_args.as_closure().upvar_tys().iter().collect::<Vec<_>>(),
-                        cl_args.as_closure().kind(),
-                        *cl_def_id,
-                    ),
-                    other => panic!(
-                        "illegal prusti::{}: expected closure, got {other:?}",
-                        if builtin == PrustiBuiltin::Forall {
-                            "forall"
-                        } else {
-                            "exists"
-                        }
-                    ),
-                };
-
-                let qvars = self.vcx.alloc_slice(
-                    &qvar_tys
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, qvar_ty)| {
-                            let ty_out = self.ty_use(qvar_ty);
-                            self.vcx.mk_local_decl(
-                                vir::vir_format!(self.vcx, "qvar_{}_{idx}", self.encoding_depth),
-                                ty_out.snapshot,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                );
-
-                let mut reify_args = vec![];
-                // TODO: big hack!
-                //   the problem is that we expect this to
-                //   be a simple Expr, but `encode_operand`
-                //   returns an ExprRet; do we need ExprRet
-                //   to be piped throughout this encoder?
-                //   alternatively, can we have an "unlift"
-                //   operation, which will work like reify
-                //   but panicking on a Lazy(..)?
-                let closure_ref = unsafe {
-                    std::mem::transmute::<ExprRet<'_>, vir::ExprGen<'_, (), !, vir::Snap>>(
-                        encoded_args[1],
-                    )
+                let name = if builtin == SpecBuiltin::Forall {
+                    "forall"
+                } else {
+                    "exists"
                 };
                 // The signature of `forall` should enforce that the argument is
                 // an `Fn` only.
@@ -1467,7 +1681,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 let body =
                     bool.expect_native().snap_to_prim.call()(body.downcast_ty()).downcast_ty();
                 // TODO: triggers
-                let res = if builtin == PrustiBuiltin::Forall {
+                let res = if builtin == SpecBuiltin::Forall {
                     self.vcx.mk_forall_expr(qvars, &[], body)
                 } else {
                     self.vcx.mk_exists_expr(qvars, &[], body)
@@ -1497,7 +1711,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     usize_.prim_to_snap.call()(prim.upcast_ty()).upcast_ty(),
                 )
             }
-            PrustiBuiltin::ModeStart(mode) => {
+            SpecBuiltin::ModeStart(mode) => {
                 match mode {
                     Mode::Old => {
                         assert!(!self.old_mode);
@@ -1522,7 +1736,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     mk_bool(self.vcx.mk_bool::<true>().lift()).upcast_ty(),
                 ) // TODO: what value do we return?
             }
-            PrustiBuiltin::ModeEnd(mode) => {
+            SpecBuiltin::ModeEnd(mode) => {
                 match mode {
                     Mode::Old => {
                         assert!(self.old_mode);

@@ -1,9 +1,11 @@
+//@ known-failure
 use prusti_contracts::*;
 
 /// Examples from Fabian Wolff's thesis.
 
 // ignore-test
-// TODO: history invariants
+// TODO: history invariants; calls of `closure!` closures cannot be
+// encoded yet
 
 fn main() {
     let mut count = 0;

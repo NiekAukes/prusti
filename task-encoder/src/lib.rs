@@ -2,17 +2,18 @@
 #![feature(associated_type_defaults)]
 
 use core::panic;
-use hashlink::LinkedHashMap;
-use prusti_rustc_interface::span::Span;
+use prusti_rustc_interface::{data_structures::fx::FxIndexMap, span::Span};
 use std::cell::RefCell;
 
 mod cache;
 mod dependencies;
 mod result;
+mod triggers;
 
 pub use cache::*;
 pub use dependencies::*;
 pub use result::*;
+pub use triggers::*;
 
 #[derive(Debug, Default)]
 pub struct Program<'vir> {
@@ -142,6 +143,12 @@ pub trait TaskEncoder {
         format!("{error:?}")
     }
 
+    /// Whether the error was already reported to the user by the encoder
+    /// itself, so that it must not be reported again as an encoder error.
+    fn error_reported(_error: &Self::EncodingError) -> bool {
+        false
+    }
+
     /// Enters the given function with a reference to the cache for this
     /// encoder.
     fn with_cache<'vir, F, R>(f: F) -> R
@@ -149,12 +156,81 @@ pub trait TaskEncoder {
         Self: 'vir,
         F: FnOnce(&'vir CacheRef<'vir, Self>) -> R;
 
+    /// Enters the given function with a reference to the trigger watchers for
+    /// this encoder. These are continuations registered via [`Self::on_task_requested`],
+    /// waiting for a task of this encoder to be requested.
+    fn with_watchers<'vir, F, R>(f: F) -> R
+    where
+        Self: 'vir,
+        F: FnOnce(&'vir WatchersRef<'vir, Self>) -> R;
+
+    /// Queues `f` to run in [`drain_triggers`] once the given task of this
+    /// encoder has been requested (enqueued, started, or encoded - not
+    /// necessarily successfully). If it already has been, `f` is queued
+    /// immediately. Continuations of tasks that are never requested do not
+    /// run.
+    ///
+    /// Triggers must be registered during the encoding phase:
+    /// [`drain_triggers`] runs before outputs are emitted, so continuations
+    /// registered during `emit_outputs` would never run. From within an
+    /// in-flight encoder that already knows the task is needed, use a plain
+    /// `deps.require_*` instead.
+    fn on_task_requested<'vir>(key: Self::TaskKey<'vir>, f: impl FnOnce() + 'vir)
+    where
+        Self: Sized + 'vir,
+    {
+        let f = mk_continuation(f);
+        let requested = Self::with_cache(|cache| cache.borrow().contains_key(&key));
+        if requested {
+            triggers::queue(f);
+        } else {
+            Self::with_watchers(move |watchers| {
+                watchers.borrow_mut().entry(key).or_default().push(f)
+            });
+        }
+    }
+
+    /// Queues `f` to run once *every* task in `keys` has been requested (the
+    /// conjunction of [`Self::on_task_requested`]). An empty `keys` runs `f`
+    /// unconditionally.
+    fn on_all_requested<'vir>(mut keys: Vec<Self::TaskKey<'vir>>, f: impl FnOnce() + 'vir)
+    where
+        Self: Sized + 'vir,
+    {
+        match keys.pop() {
+            None => queue(mk_continuation(f)),
+            Some(key) => Self::on_task_requested(key, move || Self::on_all_requested(keys, f)),
+        }
+    }
+
+    /// Queues `f` to run once *any* task in `keys` has been requested (the
+    /// disjunction of [`Self::on_task_requested`]). `f` runs at most once, on
+    /// the first such task; an empty `keys` never runs `f`.
+    fn on_any_requested<'vir>(keys: Vec<Self::TaskKey<'vir>>, f: impl FnOnce() + 'vir)
+    where
+        Self: Sized + 'vir,
+    {
+        // The continuations share ownership of `f` and race to take it, so that
+        // it runs exactly once regardless of how many keys become requested.
+        let slot: std::rc::Rc<std::cell::Cell<Option<triggers::Continuation>>> =
+            std::rc::Rc::new(std::cell::Cell::new(Some(mk_continuation(f))));
+        for key in keys {
+            let slot = slot.clone();
+            Self::on_task_requested(key, move || {
+                if let Some(f) = slot.take() {
+                    f();
+                }
+            });
+        }
+    }
+
     //fn get_all_outputs() -> Self::CacheRef<'vir> {
     //  todo!()
     //  // while ... { process() } // process items in the queue
     //  //Self::cache()
     //}
 
+    /*
     fn enqueue<'vir>(task: Self::TaskDescription<'vir>)
     where
         Self: 'vir,
@@ -167,11 +243,14 @@ pub trait TaskEncoder {
         }
 
         // enqueue, expecting no entry (we just checked)
-        assert!(Self::with_cache(move |cache| cache
-            .borrow_mut()
-            .insert(task_key, TaskEncoderCacheState::Enqueued,)
-            .is_none()));
+        triggers::fire_watchers::<Self>(&task_key);
+        let old = Self::with_cache(move |cache| {
+            let v = TaskEncoderCacheState::Enqueued;
+            cache.borrow_mut().insert(task_key, v)
+        });
+        assert!(old.is_none());
     }
+    */
 
     fn encode_ref<'vir>(
         task: Self::TaskDescription<'vir>,
@@ -186,7 +265,8 @@ pub trait TaskEncoder {
         let task_key_clone = task_key.clone();
         if let Some(output_ref) =
             Self::with_cache(move |cache| match cache.borrow().get(&task_key_clone) {
-                Some(TaskEncoderCacheState::Started { output_ref, .. })
+                Some(TaskEncoderCacheState::Started { output_ref })
+                | Some(TaskEncoderCacheState::Restarted { output_ref })
                 | Some(TaskEncoderCacheState::Encoded { output_ref, .. })
                 | Some(TaskEncoderCacheState::ErrorEncode { output_ref, .. }) => {
                     Some(output_ref.clone())
@@ -198,11 +278,10 @@ pub trait TaskEncoder {
         }
 
         // Otherwise, we need to start the encoding. Note that this is done
-        // even if the encoding was started previously, i.e. if the cache
-        // contains a `Enqueued` entry for this task. This can happen if the
-        // same task was (recursively) requested from the same encoder, before
-        // its first invocation reached a call to `emit_output_ref`.
-        // TODO: we should still make sure that *some* progress is done, because an actual cyclic dependency could cause a stack overflow?
+        // even if the encoding was started previously, i.e. if the same task
+        // was (recursively) requested from the same encoder before its first
+        // invocation reached a call to `emit_output_ref` (see
+        // `TaskEncoderCacheState::Encoding`).
         let encode_res = Self::encode(task, false, span);
         match encode_res {
             Ok(_) | Err(TaskEncoderError::DependencyError(..)) => (), // pass, check for output ref
@@ -212,7 +291,8 @@ pub trait TaskEncoder {
         let task_key_clone = task_key.clone();
         if let Some(output_ref) =
             Self::with_cache(move |cache| match cache.borrow().get(&task_key_clone) {
-                Some(TaskEncoderCacheState::Started { output_ref, .. })
+                Some(TaskEncoderCacheState::Started { output_ref })
+                | Some(TaskEncoderCacheState::Restarted { output_ref })
                 | Some(TaskEncoderCacheState::Encoded { output_ref, .. })
                 | Some(TaskEncoderCacheState::ErrorEncode { output_ref, .. }) => {
                     Some(output_ref.clone())
@@ -239,46 +319,66 @@ pub trait TaskEncoder {
         let in_cache = Self::with_cache(|cache| {
             let mut cache = cache.borrow_mut();
 
-            match cache.get(&task_key) {
-                Some(e) => match e {
+            let new_state = match cache.get(&task_key) {
+                Some(
                     TaskEncoderCacheState::ErrorEnqueue { error, .. }
-                    | TaskEncoderCacheState::ErrorEncode { error, .. } => Some(Err(error.clone())),
-                    TaskEncoderCacheState::Encoded {
-                        output_ref,
-                        output_local,
-                        output_dep,
-                        ..
-                    } => {
-                        if need_output {
-                            Some(Ok(Some((
-                                output_ref.clone(),
-                                output_local.clone(),
-                                output_dep.clone(),
-                            ))))
-                        } else {
-                            Some(Ok(None))
-                        }
-                    }
-                    // TODO: should we return Some(Ok(None)) for `Started`, if `!need_output` ?
-                    TaskEncoderCacheState::Enqueued | TaskEncoderCacheState::Started { .. } => None,
-                },
-                None => {
-                    // enqueue
-                    cache.insert(task_key.clone(), TaskEncoderCacheState::Enqueued);
-                    None
+                    | TaskEncoderCacheState::ErrorEncode { error, .. },
+                ) => return Some(Err(error.clone())),
+                Some(TaskEncoderCacheState::Encoded {
+                    output_ref,
+                    output_local,
+                    output_dep,
+                    ..
+                }) => {
+                    return if need_output {
+                        Some(Ok(Some((
+                            output_ref.clone(),
+                            output_local.clone(),
+                            output_dep.clone(),
+                        ))))
+                    } else {
+                        Some(Ok(None))
+                    };
                 }
-            }
+                // A re-run is already in progress; another one could not make
+                // progress over it (see `TaskEncoderCacheState`).
+                Some(
+                    TaskEncoderCacheState::ReEncoding | TaskEncoderCacheState::Restarted { .. },
+                ) => return Some(Err(TaskEncoderError::CyclicError)),
+                // Start the first run.
+                None => {
+                    triggers::fire_watchers::<Self>(&task_key);
+                    TaskEncoderCacheState::Encoding
+                }
+                // In progress: re-run the encoding (see
+                // `TaskEncoderCacheState::Started`).
+                Some(TaskEncoderCacheState::Encoding) => TaskEncoderCacheState::ReEncoding,
+                Some(TaskEncoderCacheState::Started { output_ref }) => {
+                    TaskEncoderCacheState::Restarted {
+                        output_ref: output_ref.clone(),
+                    }
+                }
+            };
+            cache.insert(task_key.clone(), new_state);
+            None
         });
         if let Some(in_cache) = in_cache {
             return in_cache;
         }
 
         let value = task_key.clone();
-        let catch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let mut deps = TaskEncoderDependencies::new();
-            let encode_result = Self::do_encode_full(&value, &mut deps);
-            (encode_result, deps)
-        }));
+        // The span stack is isolated across the encoder-context boundary: the
+        // encoding is demand-driven and cached, so its spans must not chain
+        // up to whatever span is ambient at the (first) demand site.
+        let catch_result = vir::with_vcx(|vcx| {
+            vcx.with_span_stack_isolated(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut deps = TaskEncoderDependencies::new();
+                    let encode_result = Self::do_encode_full(&value, &mut deps);
+                    (encode_result, deps)
+                }))
+            })
+        });
 
         let (encode_result, deps) = catch_result.map_err(|panic_payload| {
             // There was a panic within the encoder. We want to report it
@@ -294,7 +394,10 @@ pub trait TaskEncoder {
             Self::with_cache(|cache| {
                 let mut cache = cache.borrow_mut();
                 match cache.get(&task_key) {
-                    Some(TaskEncoderCacheState::Started { output_ref }) => {
+                    Some(
+                        TaskEncoderCacheState::Started { output_ref }
+                        | TaskEncoderCacheState::Restarted { output_ref },
+                    ) => {
                         let output_ref = output_ref.clone();
                         cache.insert(
                             task_key.clone(),
@@ -321,10 +424,14 @@ pub trait TaskEncoder {
             error
         })?;
 
+        // `ErrorEncode`: a suspended run whose re-run failed (moving the task
+        // to that state) finds its own error here.
         let output_ref = Self::with_cache(|cache| match cache.borrow().get(&task_key) {
             Some(
                 TaskEncoderCacheState::Started { output_ref }
-                | TaskEncoderCacheState::Encoded { output_ref, .. },
+                | TaskEncoderCacheState::Restarted { output_ref }
+                | TaskEncoderCacheState::Encoded { output_ref, .. }
+                | TaskEncoderCacheState::ErrorEncode { output_ref, .. },
             ) => output_ref.clone(),
             _ => panic!("encoder did not provide output ref for task {task_key:?}"),
         });
@@ -381,7 +488,10 @@ pub trait TaskEncoder {
                     }
                     TaskEncoderCacheState::ErrorEnqueue { error, .. }
                     | TaskEncoderCacheState::ErrorEncode { error, .. } => Err(error.clone()),
-                    TaskEncoderCacheState::Started { .. } | TaskEncoderCacheState::Enqueued => {
+                    TaskEncoderCacheState::Encoding
+                    | TaskEncoderCacheState::ReEncoding
+                    | TaskEncoderCacheState::Started { .. }
+                    | TaskEncoderCacheState::Restarted { .. } => {
                         panic!("encoder did not finish for task {task_key:?}")
                     }
                 })
@@ -417,7 +527,7 @@ pub trait TaskEncoder {
                             output_ref: output_ref.clone(),
                             deps,
                             error: TaskEncoderError::EncodingError(err.clone()),
-                            output_dep: maybe_output_dep,
+                            output_dep: maybe_output_dep.map(|dep| *dep),
                             spans: vec![span],
                         },
                     )
@@ -552,6 +662,7 @@ pub trait TaskEncoder {
                 .next()
                 .unwrap_or(prusti_rustc_interface::span::DUMMY_SP);
             let msg = match error {
+                TaskEncoderError::EncodingError(err) if Self::error_reported(&err) => continue,
                 TaskEncoderError::EncodingError(err) => Self::describe_error(err),
                 other => format!(
                     "encoder '{}' failed to encode {:?}:\n {:?}",

@@ -1,10 +1,12 @@
 use crate::encoders::{
-    TyUsePureEnc,
+    TyUseImpureEnc, TyUsePureEnc,
+    custom::ReadPermEnc,
     ty::{
-        RustImmRef, RustTyDatas,
+        RustImmRef, RustTyDatas, RustTyDecomposition,
         data::TyData,
+        generics::{ParamTypEnc, TyExprEnc},
         impure::{PredicateBuilder, TyImpureEnc, TyImpureImmRef, TyImpureImmRefData},
-        pure::{AdtBuilder, TyPureEnc, TyPureImmRef, TyPureImmRefData},
+        pure::{AdtBuilder, PureTyDatas, TyPureEnc, TyPureImmRef, TyPureImmRefData},
     },
 };
 use task_encoder::{EncodeFullError, TaskEncoderDependencies};
@@ -16,44 +18,113 @@ pub(crate) fn ty_pure<'vir>(
     deps: &mut TaskEncoderDependencies<'vir, TyPureEnc>,
     builder: &mut AdtBuilder<'vir>,
 ) -> Result<TyPureImmRef<'vir>, EncodeFullError<'vir, TyPureEnc>> {
-    // force encoding of s_Param
-    deps.require_ref::<TyUsePureEnc>(data.decompose(task_key.params))?;
+    let ty = data.metadata.decompose(task_key.params);
+    let metadata = deps.require_ref::<TyUsePureEnc>(ty)?.snapshot.downcast_ty();
+
+    let ty = data.referent.decompose(task_key.params);
+    let referent = deps.require_ref::<TyUsePureEnc>(ty)?.snapshot.downcast_ty();
 
     let (field_snaps_to_snap, field_access) =
-        builder.constructor("", (vir::TYPE_REF, vir::TYPE_PSNAP), None);
+        builder.constructor("", (vir::TYPE_REF, metadata, referent), None);
+
+    let immref_snap_decl = builder
+        .vcx
+        .mk_local_decl("immref_snap", field_snaps_to_snap.result());
+    let value_snap_fn: vir::FunctionIdn<vir::CSnap, vir::CSnap> = builder.function(
+        "value_snap_of",
+        field_snaps_to_snap.result(),
+        field_snaps_to_snap.result(),
+        (immref_snap_decl,),
+        &[],
+        &[],
+        Some(field_snaps_to_snap.call()(
+            builder.vcx.mk_null(),
+            field_access[1].downcast_ty().call()(builder.vcx.mk_local_ex(immref_snap_decl)),
+            field_access[2].downcast_ty().call()(builder.vcx.mk_local_ex(immref_snap_decl)),
+        )),
+    );
 
     Ok(TyPureImmRefData {
         prim_to_snap: field_snaps_to_snap,
         deref_access: field_access[0].downcast_ty(),
-        value_access: field_access[1].downcast_ty(),
+        metadata_access: field_access[1].downcast_ty(),
+        value_snap_fn,
+        value_access: field_access[2].downcast_ty(),
     })
 }
 
 pub(crate) fn ty_impure<'vir>(
-    _data: &(&RustImmRef<'vir>, &TyPureImmRef<'vir>),
-    _deps: &mut TaskEncoderDependencies<'vir, TyImpureEnc>,
+    task_key: &TyData<'vir, (RustTyDatas, PureTyDatas)>,
+    data: &(&RustImmRef<'vir>, &TyPureImmRef<'vir>),
+    deps: &mut TaskEncoderDependencies<'vir, TyImpureEnc>,
     builder: &mut PredicateBuilder<'vir>,
 ) -> Result<TyImpureImmRef<'vir>, EncodeFullError<'vir, TyImpureEnc>> {
-    let snap_type = builder.csnap_type();
+    let metadata_type = data.0.metadata.decompose(task_key.0.params);
+    deps.require_dep::<TyUseImpureEnc>(metadata_type)?;
+    let inner_type = data.0.referent.decompose(task_key.0.params);
+    deps.require_dep::<TyUseImpureEnc>(inner_type)?;
 
     let ref_self_decl = builder.ref_self_decl();
     let ref_self = builder.vcx.mk_local_ex(ref_self_decl);
 
-    // fields
-    let ref_field = builder.field("val", snap_type);
+    let metadata_snap = deps
+        .require_ref::<TyUsePureEnc>(metadata_type)?
+        .snapshot
+        .downcast_ty();
+
+    // fields: the referent's address and the pointer metadata. The referent's
+    // value is not stored; it is read out of the `p_Param` held below, which
+    // is what ties it to the type this predicate is instantiated at.
+    let addr_field = builder.field("addr", vir::TYPE_REF);
+    let metadata_field = builder.field("metadata", metadata_snap);
+
+    let vcx = builder.vcx;
+    let read = deps.require_dep::<ReadPermEnc>(())?.read;
+    let param_ty = deps.require_ref::<TyImpureEnc>(RustTyDecomposition::param())?;
+    let referent_ty = deps.require_dep::<TyExprEnc>(inner_type)?;
+    let metadata_ty = deps.require_dep::<TyExprEnc>(metadata_type)?;
+    let addr = vir::expr! { [addr_field](ref_self) };
+    let referent_pred = vcx.mk_predicate_app_expr((param_ty.ref_to_pred)(
+        addr,
+        vcx.alloc_slice(&[referent_ty]),
+        &[],
+    )(Some(read())));
+    // Unlike the referent, the metadata is stored rather than held as a
+    // `p_Param`, so its type has to be stated for the variant bridge.
+    let typ = deps.require_dep::<ParamTypEnc>(())?.typ;
+    let metadata_typ = |metadata| vcx.mk_eq_expr(typ(metadata), metadata_ty);
 
     // main predicate
     builder.mk_predicate(
         "",
-        Some(vir::expr! {
-            acc((ref_self).[ref_field])
-            // TODO: pure typeof assertions do not currently work
-            // && (([generic_typeof]([data.1.value_access]([ref_field](ref_self)))) == ([builder.params.ty_exprs()[0]]))
-        }), // TODO: use generic args?
+        Some(vcx.mk_conj(&[
+            vir::expr! { acc((ref_self).[addr_field]) },
+            vir::expr! { acc((ref_self).[metadata_field]) },
+            metadata_typ(vir::expr! { [metadata_field](ref_self) }),
+            referent_pred,
+        ])),
     );
 
-    // Ref-to-snap
-    builder.mk_snap_function(Some(vir::expr! { [ref_field](ref_self) }));
+    // Ref-to-snap: the referent's value comes from the `p_Param` above, whose
+    // snapshot carries its type, so the type is known by construction.
+    builder.mk_snap_function(
+        Some(data.1.prim_to_snap.call()(
+            addr,
+            vir::expr! { [metadata_field](ref_self) },
+            (param_ty.ref_to_snap)(addr, vcx.alloc_slice(&[referent_ty]), &[]).downcast_ty(),
+        )),
+        &[
+            metadata_typ(data.1.metadata_access.call()(
+                vcx.mk_result(builder.csnap_type()),
+            )),
+            vcx.mk_eq_expr(
+                typ(data.1.value_access.call()(
+                    vcx.mk_result(builder.csnap_type()),
+                )),
+                referent_ty,
+            ),
+        ],
+    );
 
     Ok(TyImpureImmRefData {
         snap: builder.ref_to_snap,

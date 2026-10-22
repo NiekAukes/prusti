@@ -3,24 +3,53 @@ use task_encoder::{EncodeFullError, TaskEncoder, TaskEncoderDependencies};
 use vir::CastType;
 
 use crate::encoders::{
-    ConstEnc, MirBuiltinEnc, MirBuiltinEncTask, r#const::ConstEncTask, ty::use_pure::TyUsePure,
+    ConstEnc, MirBuiltinBinOpEnc, MirBuiltinBinOpTask, MirBuiltinUnOpEnc, MirBuiltinUnOpTask,
+    MirBuiltinUseCastEnc, MirBuiltinUseCastTask, PrustiBuiltin, PrustiBuiltinEnc,
+    PrustiBuiltinTask,
+    r#const::ConstEncTask,
+    ty::{
+        RustTyDecomposition,
+        generics::{GArgs, GParams},
+        use_pure::TyUsePure,
+    },
 };
 use prusti_rustc_interface::{
     abi,
     index::IndexVec,
     middle::{mir, ty},
-    span::def_id::DefId,
+    span::{Span, Spanned, def_id::DefId, sym},
 };
 
 #[allow(type_alias_bounds)]
-type ExprResult<'vir, Enc: PureRvalueEnc<'vir>> = Result<
-    vir::ExprGenSnap<'vir, Enc::ExprCurr, Enc::ExprNext>,
-    EncodeFullError<'vir, Enc::Encoder>,
->;
+type ExprOutput<'vir, Enc: PureRvalueEnc<'vir>> =
+    vir::ExprGenSnap<'vir, Enc::ExprCurr, Enc::ExprNext>;
 
-pub(crate) struct EncodedCast<'vir, Enc: PureRvalueEnc<'vir> + ?Sized> {
-    pub preconditions: Vec<vir::ExprGenBool<'vir, Enc::ExprCurr, Enc::ExprNext>>,
-    pub expr: vir::ExprGenSnap<'vir, Enc::ExprCurr, Enc::ExprNext>,
+pub(crate) type EncodeResult<'vir, T, E> = Result<T, EncodeFullError<'vir, E>>;
+
+#[allow(type_alias_bounds)]
+type ExprResult<'vir, Enc: PureRvalueEnc<'vir>> =
+    EncodeResult<'vir, ExprOutput<'vir, Enc>, Enc::Encoder>;
+
+#[allow(type_alias_bounds)]
+type CastSnap<'vir, Enc: PureRvalueEnc<'vir>> = (
+    Option<vir::StmtGen<'vir, Enc::ExprCurr, Enc::ExprNext>>,
+    ExprOutput<'vir, Enc>,
+);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RustcIntrinsic {
+    PtrMetadata,
+    DiscriminantValue,
+}
+
+impl RustcIntrinsic {
+    pub(super) fn from_intrinsic(intrinsic: ty::IntrinsicDef) -> Option<Self> {
+        Some(match intrinsic.name {
+            sym::ptr_metadata => RustcIntrinsic::PtrMetadata,
+            sym::discriminant_value => RustcIntrinsic::DiscriminantValue,
+            _ => return None,
+        })
+    }
 }
 
 pub(crate) trait PureRvalueEnc<'vir> {
@@ -28,11 +57,70 @@ pub(crate) trait PureRvalueEnc<'vir> {
     type EncodePlaceCtxt;
     type ExprCurr;
     type ExprNext;
-    fn def_id(&self) -> DefId;
+    /// Whether this is the pure encoder: builtins in pure code use the
+    /// *total* versions of the partial collection operations, since the
+    /// (precondition-free) `f_` functions could never discharge their
+    /// well-definedness obligations.
+    const PURE: bool;
+    /// The generic context of the body being encoded. For a body substituted
+    /// with usage-site substs (pure/spec bodies), this is the caller's
+    /// context, in which the substituted types live - not the encoded def's.
+    fn context(&self) -> GParams<'vir>;
     fn deps(&mut self) -> &mut TaskEncoderDependencies<'vir, Self::Encoder>;
     fn vcx(&self) -> &'vir vir::VirCtxt<'vir>;
     fn body(&self) -> &mir::Body<'vir>;
     fn ty_use_pure(&mut self, ty: ty::Ty<'vir>) -> TyUsePure<'vir>;
+
+    /// When creating a reference to a place, the metadata either comes from a
+    /// deref along the projections in the place (e.g. `(*x).last_field` would
+    /// take the metadata from `x`) or the place has no derefs in which case
+    /// rustc guarantees that it is `Sized` and thus the metadata is `()`. In
+    /// this case, this function constructs such a metadata value, panicking if
+    /// we could not prove that `ref_ty` points to a sized type (which should
+    /// never happen due to the rustc guarantee).
+    fn expect_thin_ptr_metadata(
+        &mut self,
+        ref_ty: ty::Ty<'vir>,
+    ) -> vir::ExprGenSnap<'vir, Self::ExprCurr, Self::ExprNext> {
+        let metadata_ty = ref_ty.pointee_metadata_ty_or_projection(self.vcx().tcx());
+        // `pointee_metadata_ty_or_projection` only resolves bound-independent
+        // ("trivial") sizedness, leaving e.g. `<Cell<T> as Pointee>::Metadata`
+        // as a projection even though the body's `T: Sized` bound makes it
+        // `()`. Normalize in the body's environment to resolve such cases.
+        let metadata_ty = self.context().normalize(metadata_ty);
+        assert!(
+            metadata_ty.is_unit(),
+            "expected metadata type {metadata_ty:?} to be unit for a sized referent"
+        );
+        self.ty_use_pure(metadata_ty)
+            .zst_to_snap()
+            .unwrap()
+            .upcast_ty()
+    }
+
+    /// The source position currently being encoded under: the MIR statement
+    /// (or, in a pure body, the expression) whose encoding is in progress.
+    /// Falls back to the body when no span is on the stack, as when encoding
+    /// the repacks of a terminator's outgoing edges.
+    fn current_span(&self) -> Span {
+        let vcx = self.vcx();
+        vcx.top_span()
+            .and_then(|span| vcx.get_span_from_id(span.id))
+            .unwrap_or_else(|| self.body().span)
+    }
+
+    /// Build an error for an unsupported feature reached during rvalue encoding.
+    fn unsupported_rvalue(
+        &self,
+        message: String,
+        span: Span,
+    ) -> EncodeFullError<'vir, Self::Encoder> {
+        EncodeFullError::DependencyError(vec![(
+            <Self::Encoder as TaskEncoder>::ENCODER_NAME,
+            message,
+            vec![span],
+        )])
+    }
 
     /// Encodes the snapshot of an operand. In an impure context this may
     /// produce side-effects. Namely, encoding a `Move` operand will generate a
@@ -47,13 +135,13 @@ pub(crate) trait PureRvalueEnc<'vir> {
         &mut self,
         place: Place<'vir>,
         ctxt: &Self::EncodePlaceCtxt,
-    ) -> vir::ExprGenSnap<'vir, Self::ExprCurr, Self::ExprNext>;
+    ) -> ExprResult<'vir, Self>;
 
-    fn encode_cast_snap<'slf>(
-        &'slf mut self,
+    fn encode_cast_snap(
+        &mut self,
+        rvalue_ty: ty::Ty<'vir>,
         kind: mir::CastKind,
         operand: &mir::Operand<'vir>,
-        ty: ty::Ty<'vir>,
         ctxt: &Self::EncodePlaceCtxt,
     ) -> Result<EncodedCast<'vir, Self>, EncodeFullError<'vir, Self::Encoder>> {
         match kind {
@@ -132,35 +220,32 @@ pub(crate) trait PureRvalueEnc<'vir> {
         l: &mir::Operand<'vir>,
         r: &mir::Operand<'vir>,
         ctxt: &Self::EncodePlaceCtxt,
+        span: Span,
     ) -> ExprResult<'vir, Self> {
-        let encoded_l = self.encode_operand_snap(l, ctxt)?;
-        let encoded_r = self.encode_operand_snap(r, ctxt)?;
         let l_ty = l.ty(self.body(), self.vcx().tcx());
         let r_ty = r.ty(self.body(), self.vcx().tcx());
-        use crate::encoders::MirBuiltinEncTask::{BinOp, CheckedBinOp};
-        let task = if op.is_overflowing() {
-            CheckedBinOp(rvalue_ty, op, l_ty, r_ty)
-        } else {
-            BinOp(rvalue_ty, op, l_ty, r_ty)
-        };
-        let binop_function = self
+        let l_ty = RustTyDecomposition::from_ty(l_ty, self.context());
+        let r_ty = RustTyDecomposition::from_ty(r_ty, self.context());
+        let rvalue_ty = RustTyDecomposition::from_ty(rvalue_ty, self.context());
+        let task = MirBuiltinBinOpTask::new(rvalue_ty, op, l_ty, r_ty);
+        let op = self
             .deps()
-            .require_ref::<MirBuiltinEnc>(task)
-            .unwrap()
-            .bin_op()
-            .unwrap();
-        Ok(binop_function.call()(encoded_l.downcast_ty(), encoded_r.downcast_ty()).upcast_ty())
+            .require_dep_spanned::<MirBuiltinBinOpEnc>(task, span)?;
+
+        let encoded_l = self.encode_operand_snap(l, ctxt)?;
+        let encoded_r = self.encode_operand_snap(r, ctxt)?;
+        Ok(op.call()(encoded_l.downcast_ty(), encoded_r.downcast_ty()).upcast_ty())
     }
 
     fn encode_constant_snap(
         &mut self,
         constant: &mir::ConstOperand<'vir>,
-    ) -> Result<vir::ExprCSnap<'vir>, EncodeFullError<'vir, Self::Encoder>> {
-        let def_id = self.def_id();
+    ) -> EncodeResult<'vir, vir::ExprCSnap<'vir>, Self::Encoder> {
+        let context = self.context();
         self.deps().require_dep::<ConstEnc>(ConstEncTask::Mir {
             const_: constant.const_,
             encoding_depth: 0,
-            def_id,
+            context,
             span: constant.span,
         })
     }
@@ -174,13 +259,50 @@ pub(crate) trait PureRvalueEnc<'vir> {
     ) -> ExprResult<'vir, Self> {
         let encoded_operand = self.encode_operand_snap(operand, ctxt)?;
         let operand_ty = operand.ty(self.body(), self.vcx().tcx());
+        let operand_ty = RustTyDecomposition::from_ty(operand_ty, self.context());
+        let rvalue_ty = RustTyDecomposition::from_ty(rvalue_ty, self.context());
         let un_op_function = self
             .deps()
-            .require_ref::<MirBuiltinEnc>(MirBuiltinEncTask::UnOp(rvalue_ty, op, operand_ty))
-            .unwrap()
-            .un_op()
-            .unwrap();
-        Ok(un_op_function.call()(encoded_operand.downcast_ty()).upcast_ty())
+            .require_dep::<MirBuiltinUnOpEnc>(MirBuiltinUnOpTask::new(rvalue_ty, op, operand_ty))?;
+        Ok(un_op_function.call()(encoded_operand.downcast_ty()))
+    }
+
+    /// The generic arguments of a call from this encoder's body: `args`
+    /// paired with the body's generic context.
+    fn gargs(&self, args: ty::GenericArgsRef<'vir>) -> GArgs<'vir> {
+        GArgs::new(self.context(), args)
+    }
+
+    /// Encodes a call to a `prusti_contracts` builtin. Returns `None` for the
+    /// pure-only builtins (`forall`/`exists`/`spec_block`/mode markers), which
+    /// the pure encoder handles itself.
+    fn encode_prusti_builtin(
+        &mut self,
+        builtin: PrustiBuiltin,
+        def_id: DefId,
+        gargs: GArgs<'vir>,
+        args: &[Spanned<mir::Operand<'vir>>],
+        span: Span,
+        ctxt: &Self::EncodePlaceCtxt,
+    ) -> EncodeResult<'vir, Option<ExprOutput<'vir, Self>>, Self::Encoder> {
+        if matches!(builtin, PrustiBuiltin::Spec(_)) {
+            return Ok(None);
+        }
+        let is_pure = Self::PURE;
+        let expr = self
+            .deps()
+            .require_dep::<PrustiBuiltinEnc>(PrustiBuiltinTask {
+                builtin,
+                def_id,
+                args: gargs,
+                is_pure,
+                span: (!is_pure).then_some(span),
+            })?;
+        let operands = args
+            .iter()
+            .map(|arg| self.encode_operand_snap(&arg.node, ctxt))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(expr.apply(self.vcx(), &operands)))
     }
 
     fn encode_aggregate_snap(
@@ -202,19 +324,45 @@ pub(crate) trait PureRvalueEnc<'vir> {
         Ok(sl.field_snaps_to_snap(encoded_fields).upcast_ty())
     }
 
-    fn encode_len_snap(
+    fn encode_intrinsic(
         &mut self,
-        place: Place<'vir>,
+        intrinsic: RustcIntrinsic,
+        arg_tys: ty::GenericArgsRef<'vir>,
+        args: &[Spanned<mir::Operand<'vir>>],
         ctxt: &Self::EncodePlaceCtxt,
-    ) -> vir::ExprGenSnap<'vir, Self::ExprCurr, Self::ExprNext> {
-        let encoded_place = self.encode_place_snap(place, ctxt);
-        let place_ty = (*place).ty(self.body(), self.vcx().tcx());
-        let len_function = self
-            .deps()
-            .require_ref::<MirBuiltinEnc>(crate::encoders::MirBuiltinEncTask::Len(place_ty.ty))
-            .unwrap()
-            .len()
-            .unwrap();
-        len_function.call()(encoded_place.downcast_ty()).upcast_ty()
+    ) -> ExprResult<'vir, Self> {
+        match intrinsic {
+            // pub const fn ptr_metadata<P, M>(ptr: *const P) -> M
+            RustcIntrinsic::PtrMetadata => {
+                assert_eq!(arg_tys.len(), 2);
+                assert_eq!(args.len(), 1);
+                let dest_ty = arg_tys[1].expect_ty();
+                self.encode_unary_op_snap(dest_ty, mir::UnOp::PtrMetadata, &args[0].node, ctxt)
+            }
+            // pub const fn discriminant_value<T>(v: &T) -> <T as DiscriminantKind>::Discriminant
+            RustcIntrinsic::DiscriminantValue => {
+                assert_eq!(arg_tys.len(), 1);
+                assert_eq!(args.len(), 1);
+                let enum_ty = arg_tys[0].expect_ty();
+                let Some(place) = args[0].node.place() else {
+                    return Err(self.unsupported_rvalue(
+                        "`discriminant_value` of a constant operand".to_string(),
+                        args[0].span,
+                    ));
+                };
+                let deref_place = self.vcx().tcx().mk_place_deref(place);
+                let snap = self.encode_place_snap(deref_place.into(), ctxt)?;
+                let e_enum_ty = self.ty_use_pure(enum_ty);
+                match e_enum_ty.get_enumlike() {
+                    Some(e_enum_ty) => {
+                        Ok(e_enum_ty.snap_to_discr_snap(snap.downcast_ty()).upcast_ty())
+                    }
+                    None => Err(self.unsupported_rvalue(
+                        format!("`discriminant_value` of `{enum_ty}`, which has no discriminant"),
+                        args[0].span,
+                    )),
+                }
+            }
+        }
     }
 }

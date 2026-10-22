@@ -18,6 +18,7 @@ pub trait TyDatas<'vir>: Debug + Clone + Copy {
 
     type ImmRefData: Debug + Clone + 'vir = ();
     type MutRefData: Debug + Clone + 'vir = ();
+    type RawData: Debug + Clone + 'vir = ();
 
     type StructData: Debug + Clone + 'vir = ();
     type FieldData: Debug + Clone + 'vir = ();
@@ -43,6 +44,7 @@ pub enum TySpecifics<'vir, D: TyDatas<'vir>> {
     Primitive(D::PrimitiveData),
     ImmRef(D::ImmRefData),
     MutRef(D::MutRefData),
+    Raw(D::RawData),
     StructLike(StructData<'vir, D>),
     EnumLike(EnumData<'vir, D>),
     Builtin(D::BuiltinData),
@@ -108,6 +110,10 @@ impl<'vir, D: TyDatas<'vir>> TySpecifics<'vir, D> {
         Self::MutRef(data)
     }
 
+    pub fn mk_raw(data: D::RawData) -> Self {
+        Self::Raw(data)
+    }
+
     pub fn mk_structlike(data: D::StructData, fields: Vec<D::FieldData>) -> Self {
         Self::StructLike(StructData::new(data, fields))
     }
@@ -127,10 +133,6 @@ impl<'vir, D: TyDatas<'vir>> TySpecifics<'vir, D> {
     pub fn is_param(&self) -> bool {
         matches!(self, Self::Param(_))
     }
-
-    pub fn is_mutref(&self) -> bool {
-        matches!(self, Self::MutRef(_))
-    }
 }
 
 impl<'vir, D: TyDatas<'vir>> TyData<'vir, D> {
@@ -139,6 +141,7 @@ impl<'vir, D: TyDatas<'vir>> TyData<'vir, D> {
     }
 
     #[track_caller]
+    #[allow(dead_code)]
     pub fn expect_opaque(&self) -> &D::OpaqueData
     where
         Self: Debug,
@@ -157,6 +160,17 @@ impl<'vir, D: TyDatas<'vir>> TyData<'vir, D> {
         match &self.specifics {
             TySpecifics::Primitive(data) => data,
             _ => panic!("expected primitive (was {self:?})"),
+        }
+    }
+
+    #[track_caller]
+    pub fn expect_builtin(&self) -> &D::BuiltinData
+    where
+        Self: Debug,
+    {
+        match &self.specifics {
+            TySpecifics::Builtin(data) => data,
+            _ => panic!("expected builtin (was {self:?})"),
         }
     }
 
@@ -193,6 +207,17 @@ impl<'vir, D: TyDatas<'vir>> TyData<'vir, D> {
         }
     }
 
+    #[track_caller]
+    pub fn expect_raw(&self) -> &D::RawData
+    where
+        Self: Debug,
+    {
+        match &self.specifics {
+            TySpecifics::Raw(data) => data,
+            _ => panic!("expected raw (was {self:?})"),
+        }
+    }
+
     pub fn get_structlike(&self) -> Option<&StructData<'vir, D>> {
         match &self.specifics {
             TySpecifics::StructLike(data) => Some(data),
@@ -226,17 +251,6 @@ impl<'vir, D: TyDatas<'vir>> TyData<'vir, D> {
         match &self.specifics {
             TySpecifics::EnumLike(data) => data,
             _ => panic!("expected enum-like (was {self:?})"),
-        }
-    }
-
-    #[track_caller]
-    pub fn expect_builtin(&self) -> &D::BuiltinData
-    where
-        Self: Debug,
-    {
-        match &self.specifics {
-            TySpecifics::Builtin(data) => data,
-            _ => panic!("expected primitive (was {self:?})"),
         }
     }
 
@@ -394,6 +408,7 @@ impl<'vir, D1: TyDatas<'vir>, D2: TyDatas<'vir>> TyDatas<'vir> for (D1, D2) {
     type PrimitiveData = (&'vir D1::PrimitiveData, &'vir D2::PrimitiveData);
     type ImmRefData = (&'vir D1::ImmRefData, &'vir D2::ImmRefData);
     type MutRefData = (&'vir D1::MutRefData, &'vir D2::MutRefData);
+    type RawData = (&'vir D1::RawData, &'vir D2::RawData);
     type FieldData = (&'vir D1::FieldData, &'vir D2::FieldData);
     type StructData = (&'vir D1::StructData, &'vir D2::StructData);
     type VariantData = (&'vir D1::VariantData, &'vir D2::VariantData);
@@ -433,6 +448,7 @@ where
     D::PrimitiveData: PartialEq,
     D::ImmRefData: PartialEq,
     D::MutRefData: PartialEq,
+    D::RawData: PartialEq,
     D::StructData: PartialEq,
     D::FieldData: PartialEq,
     D::EnumData: PartialEq,
@@ -454,6 +470,7 @@ where
     D::PrimitiveData: Eq,
     D::ImmRefData: Eq,
     D::MutRefData: Eq,
+    D::RawData: Eq,
     D::StructData: Eq,
     D::FieldData: Eq,
     D::EnumData: Eq,
@@ -471,6 +488,7 @@ where
     D::PrimitiveData: Hash,
     D::ImmRefData: Hash,
     D::MutRefData: Hash,
+    D::RawData: Hash,
     D::StructData: Hash,
     D::FieldData: Hash,
     D::EnumData: Hash,
@@ -543,6 +561,7 @@ impl<'vir, D: TyDatas<'vir>> Debug for TySpecifics<'vir, D> {
             Self::Primitive(arg0) => f.debug_tuple("Primitive").field(arg0).finish(),
             Self::ImmRef(arg0) => f.debug_tuple("ImmRef").field(arg0).finish(),
             Self::MutRef(arg0) => f.debug_tuple("MutRef").field(arg0).finish(),
+            Self::Raw(arg0) => f.debug_tuple("Raw").field(arg0).finish(),
             Self::StructLike(arg0) => f.debug_tuple("StructLike").field(arg0).finish(),
             Self::EnumLike(arg0) => f.debug_tuple("EnumLike").field(arg0).finish(),
             Self::Builtin(arg0) => f.debug_tuple("Builtin").field(arg0).finish(),
@@ -560,6 +579,7 @@ impl<'vir, D: TyDatas<'vir>> Clone for TySpecifics<'vir, D> {
             Self::Primitive(arg0) => Self::Primitive(arg0.clone()),
             Self::ImmRef(arg0) => Self::ImmRef(arg0.clone()),
             Self::MutRef(arg0) => Self::MutRef(arg0.clone()),
+            Self::Raw(arg0) => Self::Raw(arg0.clone()),
             Self::StructLike(arg0) => Self::StructLike(arg0.clone()),
             Self::EnumLike(arg0) => Self::EnumLike(arg0.clone()),
             Self::Builtin(arg0) => Self::Builtin(arg0.clone()),
@@ -577,6 +597,7 @@ where
     D::PrimitiveData: PartialEq,
     D::ImmRefData: PartialEq,
     D::MutRefData: PartialEq,
+    D::RawData: PartialEq,
     D::StructData: PartialEq,
     D::FieldData: PartialEq,
     D::EnumData: PartialEq,
@@ -592,6 +613,7 @@ where
             (Self::Primitive(l0), Self::Primitive(r0)) => l0 == r0,
             (Self::ImmRef(l0), Self::ImmRef(r0)) => l0 == r0,
             (Self::MutRef(l0), Self::MutRef(r0)) => l0 == r0,
+            (Self::Raw(l0), Self::Raw(r0)) => l0 == r0,
             (Self::StructLike(l0), Self::StructLike(r0)) => l0 == r0,
             (Self::EnumLike(l0), Self::EnumLike(r0)) => l0 == r0,
             (Self::Builtin(l0), Self::Builtin(r0)) => l0 == r0,
@@ -610,6 +632,7 @@ where
     D::PrimitiveData: Eq,
     D::ImmRefData: Eq,
     D::MutRefData: Eq,
+    D::RawData: Eq,
     D::StructData: Eq,
     D::FieldData: Eq,
     D::EnumData: Eq,
@@ -628,6 +651,7 @@ where
     D::PrimitiveData: Hash,
     D::ImmRefData: Hash,
     D::MutRefData: Hash,
+    D::RawData: Hash,
     D::StructData: Hash,
     D::FieldData: Hash,
     D::EnumData: Hash,
@@ -653,6 +677,7 @@ impl<'vir, D: TyDatas<'vir>> TySpecifics<'vir, D> {
             (Primitive(d1), Primitive(d2)) => Primitive((d1, d2)),
             (ImmRef(d1), ImmRef(d2)) => ImmRef((d1, d2)),
             (MutRef(d1), MutRef(d2)) => MutRef((d1, d2)),
+            (Raw(d1), Raw(d2)) => Raw((d1, d2)),
             (StructLike(d1), StructLike(d2)) => StructLike(d1.zip(d2)),
             (EnumLike(d1), EnumLike(d2)) => EnumLike(d1.zip(d2)),
             (Builtin(d1), Builtin(d2)) => Builtin((d1, d2)),

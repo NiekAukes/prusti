@@ -2,7 +2,7 @@ name: Test coverage
 
 on:
   push:
-    branches: 'master'
+    branches: 'main'
     paths-ignore: 'docs/**'
 
 env:
@@ -31,8 +31,6 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "shared"
 
       - name: Enable collection of source-based coverage
         run: |
@@ -73,7 +71,7 @@ jobs:
           ./grcov "$COVERAGE_PATH" --llvm --binary-path ./target/debug/ -s . -t lcov --branch --ignore-not-existing --ignore "/*" -o lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v1
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./lcov.info
+          files: ./lcov.info

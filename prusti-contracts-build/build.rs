@@ -14,12 +14,20 @@ fn main() {
     let target: PathBuf = ["..", "target"].iter().collect();
     force_reexport_specs(target.join("verify").as_path());
 
-    // Copy just-built binaries to `target/dir` dir
-    let bin_dir = if cfg!(debug_assertions) {
-        target.join("debug")
+    // Copy the just-built binaries into a directory of our own, and run them
+    // from there. Not into `target/{debug,release}`: these binaries are also
+    // workspace members, built there separately (build dependencies use a
+    // different profile), and cargo replacing one of them while
+    // `cargo-prusti` spawns it intermittently fails the spawn with "No such
+    // file or directory". The directory sits next to `target/debug` because
+    // the binaries find the contracts, Viper and Z3 relative to their own
+    // location.
+    let bin_dir = target.join(if cfg!(debug_assertions) {
+        "prusti-contracts-build-debug"
     } else {
-        target.join("release")
-    };
+        "prusti-contracts-build-release"
+    });
+    std::fs::create_dir_all(&bin_dir).unwrap();
     for (krate, file) in [
         ("PRUSTI_LAUNCH", "cargo-prusti"),
         ("PRUSTI_LAUNCH", "prusti-rustc"),
@@ -36,7 +44,7 @@ fn main() {
     let cargo_prusti = bin_dir.join(cargo_prusti);
 
     // On Windows, copy cargo-prusti and its dependencies to a temporary location before running it
-    // to avoid locking the file in target/release, which would prevent rebuilds
+    // to avoid locking the file in `bin_dir`, which would prevent rebuilds
     let cargo_prusti_to_run = if cfg!(windows) {
         let temp_dir = std::env::temp_dir();
         let pid = std::process::id();
@@ -73,6 +81,15 @@ fn main() {
     let mut cmd = Command::new(cargo_prusti_to_run);
     cmd.env("CARGO_TARGET_DIR", target.as_os_str());
     cmd.current_dir(&prusti_contracts);
+    // Restrict to the `prusti-contracts` package: building the whole workspace
+    // (the default) also builds `prusti-contracts-proc-macros` as its own
+    // top-level unit, in addition to the separate unit Cargo builds for it as
+    // a host-side dependency of `prusti-contracts`. The two units can end up
+    // with different `Profile`s (and hence different build-dir hashes), and
+    // Cargo's uplift of the proc-macro artifact to the flat, unhashed path in
+    // `target_dir` isn't guaranteed to pick the one actually linked into
+    // `prusti-contracts`'s rlib -- which is the one `x.py package` ships.
+    cmd.args(["-p", "prusti-contracts"]);
     if !cfg!(debug_assertions) {
         cmd.arg("--release");
     }
@@ -102,16 +119,18 @@ fn main() {
 /// reexport specs if any of the `cargo-prusti`/`prusti-{rustc,driver}` changed, and so
 /// we manually force that here by deleting the `PRUSTI_LIBS` files.
 fn force_reexport_specs(target: &std::path::Path) {
-    let deps_dir = if cfg!(debug_assertions) {
-        target.join("debug").join("deps")
+    let profile_dir = if cfg!(debug_assertions) {
+        target.join("debug")
     } else {
-        target.join("release").join("deps")
+        target.join("release")
     };
-    if let Ok(files) = std::fs::read_dir(deps_dir) {
-        let libs =
-            prusti_utils::launch::PRUSTI_LIBS.map(|lib| format!("lib{}-", lib.replace('-', "_")));
-        for file in files {
-            let file = file.unwrap();
+    let libs =
+        prusti_utils::launch::PRUSTI_LIBS.map(|lib| format!("lib{}-", lib.replace('-', "_")));
+    for dir in prusti_utils::launch::build_unit_dirs(&profile_dir) {
+        let Ok(files) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for file in files.flatten() {
             let filename = file.file_name();
             let filename = filename.to_string_lossy();
             if libs.iter().any(|lib| filename.starts_with(lib)) {

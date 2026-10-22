@@ -47,7 +47,9 @@ cfg_if! {
                     check_expr_bindings(m, p.rhs);
                 }
                 StmtKindGenData::Inhale(e) |
-                StmtKindGenData::Exhale(e) => {
+                StmtKindGenData::Exhale(e) |
+                StmtKindGenData::Assert(e) |
+                StmtKindGenData::Refute(e) => {
                     check_expr_bindings(m, e.as_dyn());
                 }
                 StmtKindGenData::Unfold(app) | StmtKindGenData::Fold(app) => {
@@ -113,10 +115,23 @@ cfg_if! {
                     m.remove(name);
                 },
                 ExprKindGenData::FuncApp(FuncAppGenData { args, .. })
-                | ExprKindGenData::SetLiteral(SetLiteralGenData { values: args, .. }) => {
+                | ExprKindGenData::CollectionLiteral(CollectionLiteralGenData {
+                    values: args,
+                    ..
+                }) => {
                     for arg in args.iter() {
                         check_expr_bindings(m, *arg);
                     }
+                },
+                ExprKindGenData::CollectionUpdate(CollectionUpdateGenData { target, key, val }) => {
+                    check_expr_bindings(m, *target);
+                    check_expr_bindings(m, *key);
+                    check_expr_bindings(m, *val);
+                },
+                ExprKindGenData::CollectionLen(collection)
+                | ExprKindGenData::MapDomain(collection)
+                | ExprKindGenData::MapRange(collection) => {
+                    check_expr_bindings(m, *collection);
                 },
                 ExprKindGenData::Old(OldGenData { expr, .. }) => {
                     check_expr_bindings(m, *expr);
@@ -141,7 +156,8 @@ cfg_if! {
                     check_predicate_app_bindings(m, target);
                     check_expr_bindings(m, *expr);
                 },
-                ExprKindGenData::BinOp(BinOpGenData { lhs, rhs, .. }) => {
+                ExprKindGenData::BinOp(BinOpGenData { lhs, rhs, .. })
+                | ExprKindGenData::CollectionBinOp(CollectionBinOpGenData { lhs, rhs, .. }) => {
                     check_expr_bindings(m, *lhs);
                     check_expr_bindings(m, *rhs);
                 },
@@ -245,26 +261,92 @@ impl<'tcx> VirCtxt<'tcx> {
         self.alloc(TypeData::new(TypeKind::Set(elem_ty.as_dyn())))
     }
 
-    pub fn mk_set_literal_expr<'vir, Curr, Next, T: CompType>(
+    pub fn mk_ty_multiset<'vir, T: CompType>(
+        &'vir self,
+        elem_ty: Type<'vir, T>,
+    ) -> TypeMultiset<'vir> {
+        self.alloc(TypeData::new(TypeKind::Multiset(elem_ty.as_dyn())))
+    }
+
+    pub fn mk_ty_seq<'vir, T: CompType>(&'vir self, elem_ty: Type<'vir, T>) -> TypeSeq<'vir> {
+        self.alloc(TypeData::new(TypeKind::Seq(elem_ty.as_dyn())))
+    }
+
+    pub fn mk_ty_map<'vir, K: CompType, V: CompType>(
+        &'vir self,
+        key_ty: Type<'vir, K>,
+        val_ty: Type<'vir, V>,
+    ) -> TypeMap<'vir> {
+        self.alloc(TypeData::new(TypeKind::Map(
+            key_ty.as_dyn(),
+            val_ty.as_dyn(),
+        )))
+    }
+
+    fn mk_collection_literal_expr<'vir, Curr, Next, T: CompType>(
         &'vir self,
         values: &'vir [&'vir ExprGenData<'vir, Curr, Next, T>],
         elem_ty: Type<'vir, T>,
-    ) -> ExprGenSet<'vir, Curr, Next> {
+        ty: TypeDyn<'vir>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
         for value in values {
             if value.ty() != elem_ty {
                 typecheck_error!(
-                    "Type mismatch in set literal. Expected element type: {:?}, actual: {:?}",
+                    "Type mismatch in {:?} literal. Expected element type: {:?}, actual: {:?}",
+                    ty,
                     elem_ty,
                     value.ty(),
                 );
             }
         }
-        self.alloc(ExprGenData::new(self.alloc(ExprKindGenData::SetLiteral(
-            self.alloc(SetLiteralGenData {
+        self.alloc(ExprGenData::new(self.alloc(
+            ExprKindGenData::CollectionLiteral(self.alloc(CollectionLiteralGenData {
                 values: values.as_dyn(),
-                ty: self.mk_ty_set(elem_ty).as_dyn(),
-            }),
-        ))))
+                ty,
+            })),
+        )))
+    }
+
+    pub fn mk_set_literal_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        values: &'vir [&'vir ExprGenData<'vir, Curr, Next, T>],
+        elem_ty: Type<'vir, T>,
+    ) -> ExprGenSet<'vir, Curr, Next> {
+        self.mk_collection_literal_expr(values, elem_ty, self.mk_ty_set(elem_ty).as_dyn())
+            .downcast_ty()
+    }
+
+    pub fn mk_multiset_literal_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        values: &'vir [&'vir ExprGenData<'vir, Curr, Next, T>],
+        elem_ty: Type<'vir, T>,
+    ) -> ExprGenMultiset<'vir, Curr, Next> {
+        self.mk_collection_literal_expr(values, elem_ty, self.mk_ty_multiset(elem_ty).as_dyn())
+            .downcast_ty()
+    }
+
+    pub fn mk_seq_literal_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        values: &'vir [&'vir ExprGenData<'vir, Curr, Next, T>],
+        elem_ty: Type<'vir, T>,
+    ) -> ExprGenSeq<'vir, Curr, Next> {
+        self.mk_collection_literal_expr(values, elem_ty, self.mk_ty_seq(elem_ty).as_dyn())
+            .downcast_ty()
+    }
+
+    /// The empty `Map` literal (non-empty maps are built with
+    /// [`Self::mk_map_update_expr`]).
+    pub fn mk_map_empty_expr<'vir, Curr, Next, K: CompType, V: CompType>(
+        &'vir self,
+        key_ty: Type<'vir, K>,
+        val_ty: Type<'vir, V>,
+    ) -> ExprGenMap<'vir, Curr, Next> {
+        self.alloc(ExprGenData::new(self.alloc(
+            ExprKindGenData::CollectionLiteral(self.alloc(CollectionLiteralGenData {
+                values: &[],
+                ty: self.mk_ty_map(key_ty, val_ty).as_dyn(),
+            })),
+        )))
     }
 
     pub fn mk_ternary_expr<'vir, Curr, Next, T: CompType>(
@@ -322,7 +404,7 @@ impl<'tcx> VirCtxt<'tcx> {
     pub fn mk_labelled_old_expr<'vir, Curr, Next, T: CompType>(
         &'vir self,
         expr: ExprGen<'vir, Curr, Next, T>,
-        label: Option<CfgBlockLabelData>,
+        label: Option<CfgBlockLabelData<'vir>>,
     ) -> ExprGen<'vir, Curr, Next, T> {
         self.mk_old(expr, label.map(OldLabel::Block).unwrap_or(OldLabel::None))
     }
@@ -468,16 +550,6 @@ impl<'tcx> VirCtxt<'tcx> {
         rhs: ExprGen<'vir, Curr, Next, T>,
     ) -> ExprGenPrim<'vir, Curr, Next> {
         assert!(kind != BinOpKind::CmpEq, "Use mk_eq_expr instead");
-        assert!(kind != BinOpKind::SetIn, "Use mk_set_in_expr instead");
-        assert!(kind != BinOpKind::SetUnion, "Use mk_set_union_expr instead");
-        if lhs.ty() != rhs.ty() {
-            typecheck_error!(
-                "Type mismatch in binary operation {:?}. LHS type: {:?}, RHS type: {:?}",
-                kind,
-                lhs.ty(),
-                rhs.ty(),
-            );
-        }
         self.mk_bin_op_expr_inner(kind, lhs.as_dyn(), rhs.as_dyn())
             .downcast_ty()
     }
@@ -487,13 +559,6 @@ impl<'tcx> VirCtxt<'tcx> {
         lhs: ExprGen<'vir, Curr, Next, T>,
         rhs: ExprGen<'vir, Curr, Next, T>,
     ) -> ExprGenBool<'vir, Curr, Next> {
-        if lhs.ty() != rhs.ty() {
-            typecheck_error!(
-                "Type mismatch in equality expression. LHS type: {:?}, RHS type: {:?}",
-                lhs.ty(),
-                rhs.ty(),
-            );
-        }
         self.mk_bin_op_expr_inner(BinOpKind::CmpEq, lhs.as_dyn(), rhs.as_dyn())
             .downcast_ty()
     }
@@ -511,24 +576,323 @@ impl<'tcx> VirCtxt<'tcx> {
                 elem.ty(),
             );
         }
-        self.mk_bin_op_expr_inner(BinOpKind::SetIn, elem.as_dyn(), set.as_dyn())
-            .downcast_ty()
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Contains,
+            elem.as_dyn(),
+            set.as_dyn(),
+        )
+        .downcast_ty()
     }
 
-    pub fn mk_set_union_expr<'vir, Curr, Next>(
+    /// Membership test for a native `Set` (element in the set) or `Map` (key in
+    /// the map's domain), yielding a `Bool`. Backs the `expr!` macro's
+    /// `(x) in (c)` syntax; prefer the statically typed
+    /// [`Self::mk_set_in_expr`]/[`Self::mk_map_contains_expr`] when the
+    /// collection kind is known.
+    pub fn mk_contains_expr<'vir, Curr, Next, E: CompType, C: CompType>(
         &'vir self,
-        lhs: ExprGenSet<'vir, Curr, Next>,
-        rhs: ExprGenSet<'vir, Curr, Next>,
-    ) -> ExprGenSet<'vir, Curr, Next> {
+        elem: ExprGen<'vir, Curr, Next, E>,
+        collection: ExprGen<'vir, Curr, Next, C>,
+    ) -> ExprGenBool<'vir, Curr, Next> {
+        let valid = match collection.ty().kind() {
+            TypeKind::Set(elem_ty) | TypeKind::Map(elem_ty, _) => elem.ty().as_dyn() == *elem_ty,
+            _ => false,
+        };
+        if !valid {
+            typecheck_error!(
+                "Invalid membership expression. Element type: {:?}, collection type: {:?}",
+                elem.ty(),
+                collection.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Contains,
+            elem.as_dyn(),
+            collection.as_dyn(),
+        )
+        .downcast_ty()
+    }
+
+    /// A same-type binary set/multiset operation (union/intersection/
+    /// difference), or a `subset` comparison.
+    pub fn mk_anyset_op_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        kind: CollectionBinOpKind,
+        lhs: ExprGen<'vir, Curr, Next, T>,
+        rhs: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
         if lhs.ty() != rhs.ty() {
             typecheck_error!(
-                "Type mismatch in set union expression. LHS type: {:?}, RHS type: {:?}",
+                "Type mismatch in {:?} expression. LHS type: {:?}, RHS type: {:?}",
+                kind,
                 lhs.ty(),
                 rhs.ty(),
             );
         }
-        self.mk_bin_op_expr_inner(BinOpKind::SetUnion, lhs.as_dyn(), rhs.as_dyn())
+        self.mk_collection_bin_op_expr_inner(kind, lhs.as_dyn(), rhs.as_dyn())
+    }
+
+    pub fn mk_set_difference_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        lhs: ExprGen<'vir, Curr, Next, T>,
+        rhs: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
+        self.mk_anyset_op_expr(CollectionBinOpKind::Difference, lhs, rhs)
+    }
+
+    pub fn mk_set_subset_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        lhs: ExprGen<'vir, Curr, Next, T>,
+        rhs: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenBool<'vir, Curr, Next> {
+        self.mk_anyset_op_expr(CollectionBinOpKind::Subset, lhs, rhs)
             .downcast_ty()
+    }
+
+    /// The multiplicity of `elem` in the multiset `ms` (an `Int`).
+    pub fn mk_multiset_count_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        elem: ExprGen<'vir, Curr, Next, T>,
+        ms: ExprGenMultiset<'vir, Curr, Next>,
+    ) -> ExprGenInt<'vir, Curr, Next> {
+        if !matches!(ms.ty().kind(), TypeKind::Multiset(elem_ty) if elem.ty().as_dyn() == *elem_ty)
+        {
+            typecheck_error!(
+                "Type mismatch in multiset count expression. Have multiset type: {:?}, actual element type: {:?}",
+                ms.ty(),
+                elem.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Contains,
+            elem.as_dyn(),
+            ms.as_dyn(),
+        )
+        .downcast_ty()
+    }
+
+    pub fn mk_seq_concat_expr<'vir, Curr, Next>(
+        &'vir self,
+        lhs: ExprGenSeq<'vir, Curr, Next>,
+        rhs: ExprGenSeq<'vir, Curr, Next>,
+    ) -> ExprGenSeq<'vir, Curr, Next> {
+        if lhs.ty() != rhs.ty() {
+            typecheck_error!(
+                "Type mismatch in seq concat expression. LHS type: {:?}, RHS type: {:?}",
+                lhs.ty(),
+                rhs.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Concat,
+            lhs.as_dyn(),
+            rhs.as_dyn(),
+        )
+        .downcast_ty()
+    }
+
+    pub fn mk_seq_index_expr<'vir, Curr, Next>(
+        &'vir self,
+        seq: ExprGenSeq<'vir, Curr, Next>,
+        index: ExprGenInt<'vir, Curr, Next>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Index,
+            seq.as_dyn(),
+            index.as_dyn(),
+        )
+    }
+
+    /// Indexing into a native `Seq` (by an `Int` index) or `Map` (by a key),
+    /// yielding the dynamically typed element/value. Backs the `expr!` macro's
+    /// `(base)[index]` syntax; prefer the statically typed
+    /// [`Self::mk_seq_index_expr`]/[`Self::mk_map_lookup_expr`] when the
+    /// collection kind is known.
+    pub fn mk_index_expr<'vir, Curr, Next, B: CompType, I: CompType>(
+        &'vir self,
+        base: ExprGen<'vir, Curr, Next, B>,
+        index: ExprGen<'vir, Curr, Next, I>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
+        let valid = match base.ty().kind() {
+            TypeKind::Seq(_) => matches!(index.ty().kind(), TypeKind::Int),
+            TypeKind::Map(key_ty, _) => index.ty().as_dyn() == *key_ty,
+            _ => false,
+        };
+        if !valid {
+            typecheck_error!(
+                "Invalid indexing expression. Base type: {:?}, index type: {:?}",
+                base.ty(),
+                index.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Index,
+            base.as_dyn(),
+            index.as_dyn(),
+        )
+    }
+
+    /// The first `num` elements of `seq` (clamping, like the native Viper
+    /// operation).
+    pub fn mk_seq_take_expr<'vir, Curr, Next>(
+        &'vir self,
+        seq: ExprGenSeq<'vir, Curr, Next>,
+        num: ExprGenInt<'vir, Curr, Next>,
+    ) -> ExprGenSeq<'vir, Curr, Next> {
+        self.mk_collection_bin_op_expr_inner(CollectionBinOpKind::Take, seq.as_dyn(), num.as_dyn())
+            .downcast_ty()
+    }
+
+    /// `seq` without its first `num` elements (clamping, like the native
+    /// Viper operation).
+    pub fn mk_seq_drop_expr<'vir, Curr, Next>(
+        &'vir self,
+        seq: ExprGenSeq<'vir, Curr, Next>,
+        num: ExprGenInt<'vir, Curr, Next>,
+    ) -> ExprGenSeq<'vir, Curr, Next> {
+        self.mk_collection_bin_op_expr_inner(CollectionBinOpKind::Drop, seq.as_dyn(), num.as_dyn())
+            .downcast_ty()
+    }
+
+    pub fn mk_seq_contains_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        elem: ExprGen<'vir, Curr, Next, T>,
+        seq: ExprGenSeq<'vir, Curr, Next>,
+    ) -> ExprGenBool<'vir, Curr, Next> {
+        if !matches!(seq.ty().kind(), TypeKind::Seq(elem_ty) if elem.ty().as_dyn() == *elem_ty) {
+            typecheck_error!(
+                "Type mismatch in seq contains expression. Have seq type: {:?}, actual element type: {:?}",
+                seq.ty(),
+                elem.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Contains,
+            elem.as_dyn(),
+            seq.as_dyn(),
+        )
+        .downcast_ty()
+    }
+
+    pub fn mk_map_lookup_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        map: ExprGenMap<'vir, Curr, Next>,
+        key: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
+        if !matches!(map.ty().kind(), TypeKind::Map(key_ty, _) if key.ty().as_dyn() == *key_ty) {
+            typecheck_error!(
+                "Type mismatch in map lookup expression. Have map type: {:?}, actual key type: {:?}",
+                map.ty(),
+                key.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(CollectionBinOpKind::Index, map.as_dyn(), key.as_dyn())
+    }
+
+    pub fn mk_map_contains_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        map: ExprGenMap<'vir, Curr, Next>,
+        key: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenBool<'vir, Curr, Next> {
+        if !matches!(map.ty().kind(), TypeKind::Map(key_ty, _) if key.ty().as_dyn() == *key_ty) {
+            typecheck_error!(
+                "Type mismatch in map contains expression. Have map type: {:?}, actual key type: {:?}",
+                map.ty(),
+                key.ty(),
+            );
+        }
+        self.mk_collection_bin_op_expr_inner(
+            CollectionBinOpKind::Contains,
+            key.as_dyn(),
+            map.as_dyn(),
+        )
+        .downcast_ty()
+    }
+
+    pub fn mk_map_update_expr<'vir, Curr, Next, K: CompType, V: CompType>(
+        &'vir self,
+        map: ExprGenMap<'vir, Curr, Next>,
+        key: ExprGen<'vir, Curr, Next, K>,
+        val: ExprGen<'vir, Curr, Next, V>,
+    ) -> ExprGenMap<'vir, Curr, Next> {
+        if !matches!(
+            map.ty().kind(),
+            TypeKind::Map(key_ty, val_ty)
+                if key.ty().as_dyn() == *key_ty && val.ty().as_dyn() == *val_ty
+        ) {
+            typecheck_error!(
+                "Type mismatch in map update expression. Have map type: {:?}, actual key type: {:?}, value type: {:?}",
+                map.ty(),
+                key.ty(),
+                val.ty(),
+            );
+        }
+        self.alloc(ExprGenData::new(self.alloc(
+            ExprKindGenData::CollectionUpdate(self.alloc(CollectionUpdateGenData {
+                target: map.as_dyn(),
+                key: key.as_dyn(),
+                val: val.as_dyn(),
+            })),
+        )))
+    }
+
+    /// The native Viper sequence update `seq[index := val]`.
+    pub fn mk_seq_update_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        seq: ExprGenSeq<'vir, Curr, Next>,
+        index: ExprGenInt<'vir, Curr, Next>,
+        val: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenSeq<'vir, Curr, Next> {
+        if !matches!(seq.ty().kind(), TypeKind::Seq(elem_ty) if val.ty().as_dyn() == *elem_ty) {
+            typecheck_error!(
+                "Type mismatch in seq update expression. Have seq type: {:?}, actual value type: {:?}",
+                seq.ty(),
+                val.ty(),
+            );
+        }
+        self.alloc(ExprGenData::new(self.alloc(
+            ExprKindGenData::CollectionUpdate(self.alloc(CollectionUpdateGenData {
+                target: seq.as_dyn(),
+                key: index.as_dyn(),
+                val: val.as_dyn(),
+            })),
+        )))
+    }
+
+    /// The length/cardinality of a native Viper collection.
+    pub fn mk_collection_len_expr<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        collection: ExprGen<'vir, Curr, Next, T>,
+    ) -> ExprGenInt<'vir, Curr, Next> {
+        if !matches!(
+            collection.ty().kind(),
+            TypeKind::Set(_) | TypeKind::Multiset(_) | TypeKind::Seq(_) | TypeKind::Map(..)
+        ) {
+            typecheck_error!("Length of non-collection type: {:?}", collection.ty(),);
+        }
+        self.alloc(ExprGenData::new(
+            self.alloc(ExprKindGenData::CollectionLen(collection.as_dyn())),
+        ))
+    }
+
+    /// The domain (key set) of a native Viper `Map`.
+    pub fn mk_map_domain_expr<'vir, Curr, Next>(
+        &'vir self,
+        map: ExprGenMap<'vir, Curr, Next>,
+    ) -> ExprGenSet<'vir, Curr, Next> {
+        self.alloc(ExprGenData::new(
+            self.alloc(ExprKindGenData::MapDomain(map.as_dyn())),
+        ))
+    }
+
+    /// The range (value set) of a native Viper `Map`.
+    pub fn mk_map_range_expr<'vir, Curr, Next>(
+        &'vir self,
+        map: ExprGenMap<'vir, Curr, Next>,
+    ) -> ExprGenSet<'vir, Curr, Next> {
+        self.alloc(ExprGenData::new(
+            self.alloc(ExprKindGenData::MapRange(map.as_dyn())),
+        ))
     }
 
     /// To be used only when `kind` is generated e.g. with a `from` call.
@@ -539,9 +903,28 @@ impl<'tcx> VirCtxt<'tcx> {
         lhs: ExprGenDyn<'vir, Curr, Next>,
         rhs: ExprGenDyn<'vir, Curr, Next>,
     ) -> ExprGenDyn<'vir, Curr, Next> {
+        if lhs.ty() != rhs.ty() {
+            typecheck_error!(
+                "Type mismatch in binary operation {:?}. LHS type: {:?}, RHS type: {:?}",
+                kind,
+                lhs.ty(),
+                rhs.ty(),
+            );
+        }
         self.alloc(ExprGenData::new(self.alloc(ExprKindGenData::BinOp(
             self.alloc(BinOpGenData { kind, lhs, rhs }),
         ))))
+    }
+
+    fn mk_collection_bin_op_expr_inner<'vir, Curr, Next>(
+        &'vir self,
+        kind: CollectionBinOpKind,
+        lhs: ExprGenDyn<'vir, Curr, Next>,
+        rhs: ExprGenDyn<'vir, Curr, Next>,
+    ) -> ExprGenDyn<'vir, Curr, Next> {
+        self.alloc(ExprGenData::new(self.alloc(
+            ExprKindGenData::CollectionBinOp(self.alloc(CollectionBinOpGenData { kind, lhs, rhs })),
+        )))
     }
 
     pub fn mk_field_expr<'vir, Curr, Next, T: CompType>(
@@ -824,25 +1207,28 @@ impl<'tcx> VirCtxt<'tcx> {
         &'vir self,
         expr: ExprGenBool<'vir, Curr, Next>,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::Exhale(expr))))
+        StmtKindGenData::Exhale(expr).alloc_vcx(self)
+    }
+
+    pub fn mk_assert_stmt<'vir, Curr, Next>(
+        &'vir self,
+        expr: ExprGenBool<'vir, Curr, Next>,
+    ) -> StmtGen<'vir, Curr, Next> {
+        StmtKindGenData::Assert(expr).alloc_vcx(self)
     }
 
     pub fn mk_unfold_stmt<'vir, Curr, Next>(
         &'vir self,
         pred_app: PredicateAppGen<'vir, Curr, Next>,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(
-            self.alloc(StmtKindGenData::Unfold(pred_app)),
-        ))
+        StmtKindGenData::Unfold(pred_app).alloc_vcx(self)
     }
 
     pub fn mk_fold_stmt<'vir, Curr, Next>(
         &'vir self,
         pred_app: PredicateAppGen<'vir, Curr, Next>,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(
-            self.alloc(StmtKindGenData::Fold(pred_app)),
-        ))
+        StmtKindGenData::Fold(pred_app).alloc_vcx(self)
     }
 
     pub fn mk_package_stmt<'vir, Curr, Next>(
@@ -850,16 +1236,14 @@ impl<'tcx> VirCtxt<'tcx> {
         wand: WandGen<'vir, Curr, Next>,
         stmts: &'vir [StmtGen<'vir, Curr, Next>],
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(
-            self.alloc(StmtKindGenData::Package(wand, stmts)),
-        ))
+        StmtKindGenData::Package(wand, stmts).alloc_vcx(self)
     }
 
     pub fn mk_apply_stmt<'vir, Curr, Next>(
         &'vir self,
         wand: WandGen<'vir, Curr, Next>,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::Apply(wand))))
+        StmtKindGenData::Apply(wand).alloc_vcx(self)
     }
 
     pub fn mk_pure_assign_stmt<'vir, Curr, Next, T: CompType>(
@@ -874,12 +1258,11 @@ impl<'tcx> VirCtxt<'tcx> {
                 rhs.ty()
             );
         }
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::PureAssign(
-            self.alloc(PureAssignGenData {
-                lhs: lhs.as_dyn(),
-                rhs: rhs.as_dyn(),
-            }),
-        ))))
+        StmtKindGenData::PureAssign(self.alloc(PureAssignGenData {
+            lhs: lhs.as_dyn(),
+            rhs: rhs.as_dyn(),
+        }))
+        .alloc_vcx(self)
     }
 
     pub fn mk_local_decl_stmt<'vir, Curr, Next, T: CompType>(
@@ -887,10 +1270,7 @@ impl<'tcx> VirCtxt<'tcx> {
         local: LocalDecl<'vir, T>,
         expr: Option<ExprGen<'vir, Curr, Next, T>>,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::LocalDecl(
-            local.as_dyn(),
-            expr.map(|e| e.as_dyn()),
-        ))))
+        StmtKindGenData::LocalDecl(local.as_dyn(), expr.map(|e| e.as_dyn())).alloc_vcx(self)
     }
 
     pub fn mk_if_stmt<'vir, Curr, Next>(
@@ -899,23 +1279,54 @@ impl<'tcx> VirCtxt<'tcx> {
         then_stmts: &'vir [StmtGen<'vir, Curr, Next>],
         else_stmts: &'vir [StmtGen<'vir, Curr, Next>],
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(
-            self.alloc(StmtKindGenData::If(cond, then_stmts, else_stmts)),
-        ))
+        StmtKindGenData::If(cond, then_stmts, else_stmts).alloc_vcx(self)
+    }
+
+    pub fn mk_block_label<'vir>(
+        &'vir self,
+        block: usize,
+        pres: impl IntoIterator<Item = usize>,
+    ) -> CfgBlockLabel<'vir> {
+        let pres = self.alloc(pres.into_iter().map(|l| self.alloc(l)).collect::<Vec<_>>());
+        if pres.is_empty() {
+            self.alloc(CfgBlockLabelData::BasicBlock(block))
+        } else {
+            self.alloc(CfgBlockLabelData::PreLoopBasicBlock(block, pres))
+        }
+    }
+
+    pub fn mk_terminator_label<'vir>(
+        &'vir self,
+        block: usize,
+        pres: impl IntoIterator<Item = usize>,
+    ) -> CfgBlockLabel<'vir> {
+        let pres = self.alloc(pres.into_iter().map(|l| self.alloc(l)).collect::<Vec<_>>());
+        if pres.is_empty() {
+            self.alloc(CfgBlockLabelData::BasicBlockTerminator(block))
+        } else {
+            self.alloc(CfgBlockLabelData::PreLoopBasicBlockTerminator(block, pres))
+        }
     }
 
     pub fn mk_label_stmt<'vir, Curr, Next>(
         &'vir self,
         label: &'vir str,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::Label(label))))
+        StmtKindGenData::Label(label).alloc_vcx(self)
     }
 
     pub fn mk_inhale_stmt<'vir, Curr, Next>(
         &'vir self,
         expr: ExprGenBool<'vir, Curr, Next>,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::Inhale(expr))))
+        StmtKindGenData::Inhale(expr).alloc_vcx(self)
+    }
+
+    pub fn mk_refute_stmt<'vir, Curr, Next>(
+        &'vir self,
+        expr: ExprGenBool<'vir, Curr, Next>,
+    ) -> StmtGen<'vir, Curr, Next> {
+        StmtKindGenData::Refute(expr).alloc_vcx(self)
     }
 
     pub fn mk_assume_false_stmt<'vir, Curr, Next>(
@@ -942,7 +1353,7 @@ impl<'tcx> VirCtxt<'tcx> {
         &'vir self,
         msg: &'vir str,
     ) -> StmtGen<'vir, Curr, Next> {
-        self.alloc(StmtGenData::new(self.alloc(StmtKindGenData::Comment(msg))))
+        StmtKindGenData::Comment(msg).alloc_vcx(self)
     }
 
     pub fn mk_goto_if_stmt<'vir, Curr, Next>(
@@ -1055,31 +1466,44 @@ impl<'tcx> VirCtxt<'tcx> {
         })
     }
 
+    /// Combines `elems` as a balanced tree rather than a linear fold. This
+    /// keeps the AST depth logarithmic, otherwise deep chains would overflow
+    /// the stack of recursive consumers (serde, `ToViper`).
+    fn mk_assoc_op<'vir, Curr, Next, T: CompType>(
+        &'vir self,
+        kind: BinOpKind,
+        default: Option<ExprGen<'vir, Curr, Next, T>>,
+        elems: &[ExprGen<'vir, Curr, Next, T>],
+    ) -> ExprGen<'vir, Curr, Next, T>
+    where
+        crate::Prim: crate::TransmuteFrom<T>,
+    {
+        match elems {
+            [] => default.unwrap(),
+            [e] => e,
+            _ => {
+                let (left, right) = elems.split_at(elems.len() / 2);
+                let lhs = self.mk_assoc_op(kind, None, left);
+                let rhs = self.mk_assoc_op(kind, None, right);
+                self.mk_bin_op_expr(kind, lhs, rhs).downcast_ty()
+            }
+        }
+    }
+
     pub fn mk_conj<'vir, Curr, Next>(
         &'vir self,
         elems: &[ExprGenBool<'vir, Curr, Next>],
     ) -> ExprGenBool<'vir, Curr, Next> {
-        elems
-            .split_last()
-            .map(|(last, rest)| {
-                rest.iter().rfold(*last, |acc, e| {
-                    self.mk_bin_op_expr(BinOpKind::And, e.as_dyn(), acc.as_dyn())
-                        .downcast_ty()
-                })
-            })
-            .unwrap_or_else(|| self.mk_bool::<true>().lazy())
+        let default = Some(self.mk_bool::<true>().lazy());
+        self.mk_assoc_op(BinOpKind::And, default, elems)
     }
 
-    pub fn mk_disj<'vir>(&'vir self, elems: &[ExprBool<'vir>]) -> ExprBool<'vir> {
-        elems
-            .split_last()
-            .map(|(last, rest)| {
-                rest.iter().rfold(*last, |acc, e| {
-                    self.mk_bin_op_expr(BinOpKind::Or, e.as_dyn(), acc.as_dyn())
-                        .downcast_ty()
-                })
-            })
-            .unwrap_or_else(|| self.mk_bool::<false>())
+    pub fn mk_disj<'vir, Curr, Next>(
+        &'vir self,
+        elems: &[ExprGenBool<'vir, Curr, Next>],
+    ) -> ExprGenBool<'vir, Curr, Next> {
+        let default = Some(self.mk_bool::<false>().lazy());
+        self.mk_assoc_op(BinOpKind::Or, default, elems)
     }
 
     pub const fn get_int_data(rust_ty: &ty::TyKind) -> (u32, bool) {
@@ -1134,8 +1558,10 @@ impl<'tcx> VirCtxt<'tcx> {
             (u32::BITS, _) => self.mk_uint::<{ 1_u128 << u32::BITS }>(),
             (u64::BITS, _) => self.mk_uint::<{ 1_u128 << u64::BITS }>(),
             (u128::BITS, _) => {
+                // `2^128` overflows `u128` and can't be written as a literal, so
+                // build it as `2^127 + 2^127` in the (unbounded) Viper `Int`.
                 // TODO: make this a `const` once `Expr` isn't invariant in `'vir` so that it can be `'const` instead
-                let half = self.mk_uint::<{ 1_u128 << u64::BITS }>();
+                let half = self.mk_uint::<{ 1_u128 << (u128::BITS - 1) }>();
                 self.mk_bin_op_expr(BinOpKind::Add, half.as_dyn(), half.as_dyn())
                     .downcast_ty()
             }
@@ -1163,5 +1589,27 @@ impl<'tcx> VirCtxt<'tcx> {
             (u128::BITS, _) => self.mk_uint::<{ u128::BITS as u128 }>(),
             _ => unreachable!(),
         }
+    }
+    /// Wrap `exp` into the range of the integer type `rust_ty` (two's complement):
+    /// a `uN` target is `exp mod 2^N`; an `iN` target is
+    /// `((exp + 2^(N-1)) mod 2^N) - 2^(N-1)`. This is the identity when `exp` is
+    /// already in range, and reproduces Rust's `as`/wrapping-arithmetic otherwise.
+    pub fn get_wrapped_val<'vir>(
+        &'vir self,
+        mut exp: ExprInt<'vir>,
+        rust_ty: &ty::TyKind,
+    ) -> ExprInt<'vir> {
+        let shift_amount = self.get_signed_shift_int(rust_ty);
+        if let Some(half) = shift_amount {
+            exp = self.mk_bin_op_expr(BinOpKind::Add, exp, half).downcast_ty();
+        }
+        let modulo_val = self.get_modulo_int(rust_ty);
+        exp = self
+            .mk_bin_op_expr(BinOpKind::Mod, exp, modulo_val)
+            .downcast_ty();
+        if let Some(half) = shift_amount {
+            exp = self.mk_bin_op_expr(BinOpKind::Sub, exp, half).downcast_ty();
+        }
+        exp
     }
 }

@@ -1,6 +1,5 @@
 #![feature(rustc_private)]
 #![feature(never_type)]
-#![feature(iter_intersperse)]
 #![feature(unboxed_closures, fn_traits, tuple_trait)]
 #![feature(macro_metavar_expr)]
 #![allow(clippy::needless_lifetimes)]
@@ -20,6 +19,7 @@ mod spans;
 mod callable;
 mod viper_ident;
 mod r#type;
+mod visit;
 
 pub use callable::*;
 pub use context::*;
@@ -31,6 +31,7 @@ pub use refs::*;
 pub use reify::*;
 pub use spans::VirSpan;
 pub use viper_ident::*;
+pub use visit::*;
 
 // for all arena-allocated types, there are two type definitions: one with
 // a `Data` suffix, containing the actual data; and one without the suffix,

@@ -162,7 +162,7 @@ where
                 Some(mut result) => {
                     info!(
                         "Using cached result {:?} for program {}",
-                        &result, &program_name
+                        result, program_name
                     );
                     result.cached = true;
                     futures::stream::once(async move { ServerMessage::Termination(result) })
@@ -187,7 +187,7 @@ where
                 {
                     info!(
                         "Storing new cached result {:?} for program {}",
-                        &result, &program_name
+                        result, program_name
                     );
                     CACHE.insert(request_hash, result.clone());
                 }
@@ -196,5 +196,9 @@ where
             ws_send.send(msg).await.unwrap();
         }
         ws_send.close().await.unwrap();
+        // Wait for the client to answer the Close frame or disconnect before
+        // dropping the socket. Dropping it with the client's reply still unread
+        // makes Windows reset the connection, and the client then fails.
+        while let Some(Ok(_)) = ws_recv.next().await {}
     })
 }

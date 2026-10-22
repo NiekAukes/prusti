@@ -2,16 +2,16 @@ name: Test
 
 on:
   push:
-    branches: [master, rewrite-2023, staging, trying]
+    branches: [main]
     paths-ignore: 'docs/**'
   pull_request:
-    branches: [master, rewrite-2023]
+    branches: [main]
     paths-ignore: 'docs/**'
 
 # Cancel previous runs in a PR when pushing new commits
 concurrency:
   group: worflow-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Do not cancel when testing the master branch
+  # Do not cancel when testing the main branch
   cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
 
 env:
@@ -37,7 +37,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "shared"
+          # Builds a subset of what `all-tests` builds, which saves the cache.
+          shared-key: "build"
+          save-if: false
       - name: Compile
         run: |
           python ./x.py build --all
@@ -72,8 +74,6 @@ jobs:
         run: python x.py setup
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "shared"
       - name: Check and report Clippy errors
         run: |
           python ./x.py clippy -- --no-deps -D warnings
@@ -96,8 +96,6 @@ jobs:
         run: python x.py setup
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "shared"
       - name: Compile each workspace package individually
         run: |
           cargo install cargo-hack
@@ -142,7 +140,7 @@ jobs:
 
   # Run all the tests.
   all-tests:
-    needs: [compile-check, check-deps, smir-check] # , quick-tests]
+    needs: [compile-check, smir-check] # , quick-tests]
     strategy:
       matrix:
         os: [ubuntu-latest] # , windows-latest, macos-latest]
@@ -169,7 +167,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "shared"
+          shared-key: "build"
+          # Failing tests do not invalidate the build artifacts.
+          cache-on-failure: true
       - name: Prepare verification cache keys
         shell: bash
         run: |
@@ -197,7 +197,7 @@ jobs:
   # Test cargo-prusti on a collection of crates.
   #test-crates:
   #  needs: [fmt-check, clippy-check, check-deps, smir-check, quick-tests]
-  #  runs-on: ubuntu-22.04
+  #  runs-on: ubuntu-latest
   #  if: false # disabled for v2 for now
   #  strategy:
   #    matrix:
@@ -227,10 +227,10 @@ jobs:
   #    - name: Test Prusti on a collection of crates
   #      run: ./target/release/test-crates --fail-fast --num-shards=4 --shard-index=${{ matrix.shard_index }}
 
-  # Dummy job to specify the jobs that must pass before merging on master
+  # Dummy job to specify the jobs that must pass before merging on main
   can-merge:
     runs-on: ubuntu-latest
-    needs: [all-tests] #, test-crates]
+    needs: [check-deps, all-tests] #, test-crates]
     # Always run, even if the workflow was cancelled
     if: ${{ always() }}
     steps:

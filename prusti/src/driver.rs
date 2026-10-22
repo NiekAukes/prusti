@@ -5,8 +5,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #![feature(rustc_private)]
-#![feature(proc_macro_internals)]
-#![feature(decl_macro)]
+#![feature(exitcode_exit_method)]
 #![allow(internal_features)]
 #![deny(unused_must_use)]
 
@@ -14,6 +13,7 @@ mod arg_value;
 mod callbacks;
 mod verifier;
 
+use crate::config::VerifyMode;
 use arg_value::arg_value;
 use callbacks::PrustiCompilerCalls;
 use log::info;
@@ -27,7 +27,7 @@ use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::{filter::EnvFilter, prelude::*};
 
 /// Link to report Prusti bugs
-const BUG_REPORT_URL: &str = "https://github.com/viperproject/prusti-dev/issues/new";
+const BUG_REPORT_URL: &str = "https://github.com/prusti/prusti/issues/new";
 
 fn get_prusti_version_info() -> String {
     format!(
@@ -98,7 +98,7 @@ fn main() {
         || build_script_build
         || (!is_primary_package && config::ignore_deps_contracts())
     {
-        driver::main();
+        driver::main().exit_process();
     }
 
     // Initialize Prusti and the Rust compiler loggers.
@@ -116,7 +116,7 @@ fn main() {
     // Remote dependencies (e.g. from git/crates.io), or any dependencies if `no_verify_deps`,
     // are not verified. However, we still run Prusti on them to export potential specs.
     if is_no_verify_dep_crate || are_lints_disabled {
-        config::set_no_verify(true);
+        config::set_verify_mode(VerifyMode::CompileOnly);
     }
 
     // Disable incremental compilation because it causes mir_borrowck not to be called.
@@ -207,5 +207,5 @@ fn main() {
         );
     }
 
-    std::process::exit(exit_code)
+    exit_code.exit_process();
 }

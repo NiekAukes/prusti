@@ -1,17 +1,21 @@
-use prusti_interface::specs::{is_spec_fn, specifications::SpecQuery};
+use prusti_interface::specs::is_spec_fn;
 use prusti_rustc_interface::{
     middle::{mir, ty},
     span::def_id::DefId,
 };
 use task_encoder::{EncodeFullResult, OutputRefAny, TaskEncoder, TaskEncoderDependencies};
-use vir::{FunctionIdn, MethodIdn, vir_format_identifier};
+use vir::{FunctionIdn, MethodIdn, ViperIdent, vir_format_identifier};
 
 use crate::{
     encoders::{
-        FunctionCallEnc, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc,
-        mir_fn::CallTaskDescription,
+        MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc,
         pure::spec::MirSpecEncMode,
-        ty::generics::{GParams, GenericParamsEnc},
+        ty::{
+            RustTyDecomposition,
+            generics::{GArgs, GParams, GenericParamsEnc, r#trait::TraitEnc, trait_impls},
+            lifted::TyConstructorEnc,
+            use_inhabited::TyUseInhabitedEnc,
+        },
     },
     trait_support::is_function_with_body,
 };
@@ -86,7 +90,7 @@ impl TaskEncoder for TraitFnEnc {
                 .trait_container(tcx)
                 .expect("task key should be the associated item of a trait");
 
-            let trait_name = vcx.alloc_str(tcx.item_name(trait_def_id).as_str());
+            let trait_name = ViperIdent::from_def_id(vcx, trait_def_id);
 
             let mut axioms = Vec::new();
             let mut funcs = Vec::new();
@@ -96,7 +100,7 @@ impl TaskEncoder for TraitFnEnc {
             // item_generics also includes parameters of trait itself
             let item_params = GParams::from(def_id);
             let item_generics = deps.require_dep::<GenericParamsEnc>(item_params)?;
-            let item_name = tcx.item_name(def_id);
+            let item_name = ViperIdent::from_def_id(vcx, def_id);
 
             let local_defs = deps.require_dep::<MirLocalDefEnc>(MirLocalDefEncTask::Local {
                 def_id,
@@ -107,11 +111,10 @@ impl TaskEncoder for TraitFnEnc {
             let return_type = local_defs.snap_ty_return();
             let ref_args = vcx.alloc_slice(&vec![vir::TYPE_REF; arg_count]);
 
-            let is_pure = crate::encoders::with_proc_spec(
-                SpecQuery::GetProcKind(def_id, item_params.rust_params()),
-                |spec| spec.kind.is_pure().unwrap_or_default(),
-            )
-            .unwrap_or_default();
+            let is_pure = crate::encoders::is_function_pure(
+                def_id,
+                GArgs::new(item_params, item_params.rust_params()),
+            );
 
             let pre_func = FunctionIdn::new(
                 vir_format_identifier!(vcx, "{trait_name}_fn_pre_{item_name}"),
@@ -177,26 +180,66 @@ impl TaskEncoder for TraitFnEnc {
                     call_stub_pure_function,
                 },
             )?;
+            // The stubs' semantics are given by the impls' axioms; require the
+            // trait so that its impls' condition/axiom triggers are registered
+            // (foreign traits are not encoded by `encode_all_in_crate`).
+            deps.require_ref::<TraitEnc>(trait_def_id)?;
             dom_funcs.push(vcx.mk_domain_function(pre_func, false, None));
             dom_funcs.push(vcx.mk_domain_function(post_func, false, None));
 
-            let func_args = local_defs.local_decl_args().collect::<Vec<_>>();
-            let func_ret = local_defs.local_decl_ret();
-
+            // The stub emitted below is only useful together with the axioms
+            // bridging the abstract pre/post functions to concrete impl
+            // specs. Unlock, per impl of the trait, the axioms of just the
+            // item implementing this function once the impl's constructor
+            // keys are requested - the same gating as the impl's condition
+            // (see `TraitEnc`), but calling a trait function must not pull in
+            // the trait's whole machinery. An impl that inherits a pure
+            // default body instead unlocks the axiom stating that body at its
+            // trait refs. Only final definitions are assumed (see
+            // `final_leaf_def`).
             let has_body = is_function_with_body(vcx.tcx(), def_id);
+            for impl_did in trait_impls::implementing_impls(tcx, trait_def_id) {
+                let Some(leaf) = trait_impls::final_leaf_def(tcx, impl_did, def_id) else {
+                    continue;
+                };
+                let keys = trait_impls::impl_unlock_keys(impl_did);
+                let impl_span = tcx.def_span(impl_did);
+                if !leaf.defining_node.is_from_trait() {
+                    let item_did = leaf.item.def_id;
+                    TyConstructorEnc::on_all_requested(keys, move || {
+                        let _ = trait_impls::TraitImplItemEnc::encode(
+                            (impl_did, item_did),
+                            false,
+                            impl_span,
+                        );
+                    });
+                } else if has_body && is_pure {
+                    TyConstructorEnc::on_all_requested(keys, move || {
+                        let _ = trait_impls::TraitImplDefaultFnEnc::encode(
+                            (impl_did, def_id),
+                            false,
+                            impl_span,
+                        );
+                    });
+                }
+            }
+
+            let func_args = local_defs.local_decl_args().collect::<Vec<_>>();
+            let func_arg_exprs = vcx.alloc_slice(
+                &func_args
+                    .iter()
+                    .map(|arg| vcx.mk_local_ex(arg))
+                    .collect::<Vec<_>>(),
+            );
+            let func_ret = local_defs.local_decl_ret();
 
             let spec = deps.require_dep_spanned::<MirSpecEnc>(
                 (def_id, def_id, MirSpecEncMode::PureWithoutResult),
                 span,
             )?;
-            let pres = vcx.mk_conj(&spec.pres);
+            let pres = vcx.mk_conj(&spec.pre_exprs().collect::<Vec<_>>());
             let pre_func_call = pre_func.call()(
-                vcx.alloc_slice(
-                    &func_args
-                        .iter()
-                        .map(|arg| vcx.mk_local_ex(arg))
-                        .collect::<Vec<_>>(),
-                ),
+                func_arg_exprs,
                 item_generics.ty_exprs(),
                 item_generics.const_exprs(),
             );
@@ -210,34 +253,18 @@ impl TaskEncoder for TraitFnEnc {
                         (pres) ==> (pre_func_call)
                 },
             ));
-            let mut posts = spec.posts;
-            if has_body && is_pure {
-                let pure_func = deps.require_dep::<FunctionCallEnc>(
-                    CallTaskDescription::new(def_id, item_params.rust_params(), def_id)
-                        .resolve_trait_calls(false),
-                )?;
-                let pure_func_app = pure_func.call_pure(
-                    func_args
-                        .iter()
-                        .map(|arg| vcx.mk_local_ex(arg))
-                        .collect::<Vec<_>>(),
-                );
-                posts.push(vir::expr! {
-                    ([func_ret]) == ([pure_func_app])
-                });
-            }
-            let posts = vcx.mk_conj(&posts);
+            // A default body is not part of the trait's contract: impls may
+            // override it with a different result.
+            let posts = vcx.mk_conj(&spec.post_exprs().collect::<Vec<_>>());
             let post_func_call = post_func.call()(
                 vcx.mk_local_ex(func_ret),
-                vcx.alloc_slice(
-                    &func_args
-                        .iter()
-                        .map(|arg| vcx.mk_local_ex(arg))
-                        .collect::<Vec<_>>(),
-                ),
+                func_arg_exprs,
                 item_generics.ty_exprs(),
                 item_generics.const_exprs(),
             );
+            // Impls may weaken the preconditions, so a call can be valid
+            // outside them; the trait's postconditions are only promised
+            // where they held. `post_func` receives the arguments' pre-state.
             axioms.push(vcx.mk_domain_axiom(
                 vir_format_identifier!(
                     vcx,
@@ -245,7 +272,7 @@ impl TaskEncoder for TraitFnEnc {
                 ),
                 vir::expr! {
                     forall [func_ret], ..[func_args], ..[item_generics.ty_decls()], ..[item_generics.const_decls()] :: {[post_func_call]}
-                        (post_func_call) ==> (posts)
+                        (post_func_call) ==> ((pres) ==> (posts))
                 },
             ));
 
@@ -273,11 +300,24 @@ impl TaskEncoder for TraitFnEnc {
                     item_generics.ty_exprs(),
                     item_generics.const_exprs(),
                 ));
+
+                // If the call succeeds, then its return type is definitely inhabited
+                // We need this postcondition to generate impure wrapper fns
+                // See tests/verify/pass/extern-spec/module-arg.rs
+                let ret_ty = tcx
+                    .instantiate_and_normalize_erasing_regions(
+                        ty::GenericArgs::identity_for_item(tcx, def_id),
+                        ty::TypingEnv::post_analysis(tcx, def_id),
+                        tcx.fn_sig(def_id),
+                    )
+                    .skip_binder()
+                    .output();
+                let ret_ty = RustTyDecomposition::from_ty(ret_ty, def_id);
+                stub_posts.push(deps.require_ref::<TyUseInhabitedEnc>(ret_ty)?.inhabited());
+                // stub_posts.push(local_defs.ret().inhabited);
+
                 let wrapped_call = call_stub_pure_function.unwrap().call()(
-                    &func_args
-                        .iter()
-                        .map(|arg| vcx.mk_local_ex(arg))
-                        .collect::<Vec<_>>(),
+                    func_arg_exprs,
                     item_generics.ty_exprs(),
                     item_generics.const_exprs(),
                 );

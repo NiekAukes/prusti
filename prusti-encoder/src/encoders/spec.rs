@@ -3,12 +3,14 @@ use std::cell::RefCell;
 use prusti_interface::specs::{
     specifications::SpecQuery,
     typed::{
-        DefSpecificationMap, ExternSpecKind, Pledge, ProcedureSpecification, SpecificationItem,
+        self, DefSpecificationMap, ExternSpecKind, Pledge, ProcedureSpecification,
+        SpecificationItem,
     },
 };
 use prusti_rustc_interface::{middle::ty, span::def_id::DefId};
 use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::VirCtxt;
+
+use crate::encoders::ty::generics::GArgs;
 
 pub struct SpecEnc;
 
@@ -17,9 +19,9 @@ pub type SpecEncError = ();
 #[derive(Clone, Debug)]
 pub struct SpecEncOutput<'vir> {
     pub extern_spec: Option<ExternSpecKind>,
-    pub pres: &'vir [DefId],
-    pub posts: &'vir [DefId],
-    pub pledges: &'vir [Pledge],
+    pub pres: SpecificationItem<&'vir [DefId]>,
+    pub posts: SpecificationItem<&'vir [DefId]>,
+    pub pledges: SpecificationItem<&'vir [Pledge]>,
 }
 
 thread_local! {
@@ -46,15 +48,99 @@ where
     })
 }
 
+/// Whether a function's spec is trusted -- assumed rather than verified. This
+/// holds if the function itself is marked `#[trusted]` (never inherited; see
+/// `ProcedureSpecification::refine`), or if the spec derives from an
+/// `#[extern_spec]` and the function is foreign: such specs are always
+/// assumed (the mandatory `#[trusted]` inside the extern spec covers them).
+/// In particular a foreign impl inheriting the spec of an extern-spec'd trait
+/// method is assumed, necessarily: the annotation postdates the compilation
+/// of the defining crate (or that crate is not compiled by Prusti at all,
+/// e.g. `std`), so no body for it can ever have been exported. A *local* impl
+/// of such a trait has a body and is verified.
+pub fn spec_is_trusted(proc_spec: &ProcedureSpecification, def_id: DefId) -> bool {
+    let user_trusted = proc_spec
+        .trusted
+        .extract_with_selective_replacement()
+        .copied()
+        .unwrap_or_default();
+    let extern_trusted = proc_spec.extern_spec.is_some() && !def_id.is_local();
+    user_trusted || extern_trusted
+}
+
 pub fn is_function_trusted(def_id: DefId) -> bool {
     let substs = ty::GenericArgs::identity_for_item(vir::with_vcx(|vcx| vcx.tcx()), def_id);
     with_proc_spec(
         SpecQuery::GetProcKind(def_id, substs),
-        |proc_spec: &ProcedureSpecification| {
-            proc_spec.trusted.extract_inherit().unwrap_or_default()
-        },
+        |proc_spec: &ProcedureSpecification| spec_is_trusted(proc_spec, def_id),
     )
     .unwrap_or_default()
+}
+
+pub fn is_function_pure<'tcx>(def_id: DefId, args: GArgs<'tcx>) -> bool {
+    with_proc_spec(
+        SpecQuery::GetProcKind(def_id, args.args()),
+        |proc_spec: &ProcedureSpecification| kind_is_pure(&proc_spec.kind),
+    )
+    .unwrap_or_default()
+}
+
+/// `kind.is_pure()`, treating an invalid trait-to-impl kind refinement as
+/// impure. This is a pure query; the refinement error itself is reported to
+/// the user separately by [`report_kind_refinement_error`].
+pub fn kind_is_pure(kind: &SpecificationItem<typed::ProcedureSpecificationKind>) -> bool {
+    kind.is_pure().unwrap_or(false)
+}
+
+/// Emit a user error for an invalid trait-to-impl kind refinement (e.g. an
+/// `impl` of a `#[pure]` trait method that is not itself `#[pure]`); a no-op if
+/// the refinement is valid. Kept separate from the purity query so it can be
+/// called once per function, at encoding time, rather than on every query.
+pub fn report_kind_refinement_error(
+    def_id: DefId,
+    kind: &SpecificationItem<typed::ProcedureSpecificationKind>,
+) {
+    use typed::ProcedureSpecificationKind::*;
+    let Err(typed::ProcedureSpecificationKindError::InvalidSpecKindRefinement(base, refined)) =
+        kind.is_pure()
+    else {
+        return;
+    };
+    vir::with_vcx(|vcx| {
+        let name = vcx.tcx().def_path_str(def_id);
+        let span = vcx.tcx().def_span(def_id).into();
+        let error = match (base, refined) {
+            (Pure, Impure) => {
+                let mut error = prusti_interface::PrustiError::incorrect(
+                    format!("`{name}` implements a `#[pure]` trait method and so must itself be `#[pure]`"),
+                    span,
+                )
+                .set_help("add `#[pure]` to the implementation");
+                // Point at the `#[pure]` in the trait definition (its
+                // `specs_version` marker is spanned at the annotation), when
+                // the trait method is available locally.
+                if let Some(trait_item) = vcx
+                    .tcx()
+                    .opt_associated_item(def_id)
+                    .and_then(|item| item.trait_item_def_id())
+                    && let Some(pure_span) =
+                        prusti_interface::utils::get_prusti_attr_of(vcx.tcx(), trait_item, "pure")
+                            .map(|item| item.span)
+                {
+                    error = error.add_note(
+                        "the trait method is declared `#[pure]` here",
+                        Some(pure_span),
+                    );
+                }
+                error
+            }
+            _ => prusti_interface::PrustiError::incorrect(
+                format!("the specification of `{name}` is incompatible with the trait declaration"),
+                span,
+            ),
+        };
+        vcx.emit_early_error(error);
+    });
 }
 
 pub fn is_type_trusted(ty: ty::Ty) -> bool {
@@ -109,19 +195,18 @@ impl TaskEncoder for SpecEnc {
                 ),
                 |specs| {
                     // TODO: handle specs other than `empty_or_inherent`
-                    let pres = get_spec_items(vcx, &specs.pres);
-                    let posts = get_spec_items(vcx, &specs.posts);
-                    let pledges = get_spec_items(vcx, &specs.pledges);
+                    let pres = specs.pres.map(|items| vcx.alloc_slice(items));
+                    let posts = specs.posts.map(|items| vcx.alloc_slice(items));
+                    let pledges = specs.pledges.map(|items| vcx.alloc_slice(items));
                     (specs.extern_spec, pres, posts, pledges)
                 },
             )
-            .unwrap_or((None, &[], &[], &[]));
-            let pledges = vcx.alloc_slice(
-                &pledges
-                    .iter()
-                    .map(|pledge| Pledge::new(pledge.lhs, pledge.rhs))
-                    .collect::<Vec<_>>(),
-            );
+            .unwrap_or((
+                None,
+                SpecificationItem::Empty,
+                SpecificationItem::Empty,
+                SpecificationItem::Empty,
+            ));
             Ok((
                 (),
                 SpecEncOutput {
@@ -135,15 +220,14 @@ impl TaskEncoder for SpecEnc {
     }
 }
 
-fn get_spec_items<'vir, T: Copy>(
-    vcx: &'vir VirCtxt<'_>,
-    spec: &SpecificationItem<Vec<T>>,
-) -> &'vir [T] {
+/// The items to encode for one kind of specification, and whether they are
+/// expressed in the generics of the item they were inherited from rather than
+/// those of the item being encoded.
+pub fn spec_items<'vir, T>(spec: &SpecificationItem<&'vir [T]>) -> (&'vir [T], bool) {
     match spec {
-        SpecificationItem::Inherent(items) | SpecificationItem::Inherited(items) => {
-            vcx.alloc_slice(items)
-        }
-        SpecificationItem::Empty => &[],
+        SpecificationItem::Empty => (&[], false),
+        SpecificationItem::Inherent(items) => (items, false),
+        SpecificationItem::Inherited(items) => (items, true),
         SpecificationItem::Refined(_from, to) => {
             // Here we ignore the original specs: to get to this branch, the
             // task key given to `SpecEnc` was the `DefId` of an trait method
@@ -153,7 +237,7 @@ fn get_spec_items<'vir, T: Copy>(
             // At callsites, `MethodCallEnc` will direct the call to the stub
             // method, which uses the `DefId` of the trait item for emitting
             // its specifications.
-            vcx.alloc_slice(to)
+            (to, false)
         }
     }
 }

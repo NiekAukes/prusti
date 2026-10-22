@@ -2,13 +2,17 @@ use std::borrow::Borrow;
 
 use prusti_interface::{
     PrustiError,
-    specs::{specifications::find_trait_method_substs, typed::Pledge},
+    specs::{
+        specifications::find_trait_method_substs,
+        typed::{ExternSpecKind, Pledge},
+    },
 };
 use prusti_rustc_interface::{
-    middle::mir,
+    middle::{mir, ty},
     span::{Span, def_id::DefId},
 };
 
+use rustc_hash::FxHashMap;
 use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, HasType, Reify};
 
@@ -33,16 +37,16 @@ pub struct PledgeExpr<'vir> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PledgeArgs<'vir>(&'vir [vir::ExprSnap<'vir>]);
+pub struct PledgeArgs<'vir>(&'vir FxHashMap<mir::Local, vir::ExprSnap<'vir>>, mir::Local);
 
 impl<'vir> std::ops::Index<mir::Local> for PledgeArgs<'vir> {
     type Output = vir::ExprSnap<'vir>;
 
     fn index(&self, index: mir::Local) -> &Self::Output {
         if index == mir::RETURN_PLACE {
-            self.0.last().unwrap()
+            &self.0[&self.1]
         } else {
-            &self.0[index.as_usize() - 1]
+            &self.0[&index]
         }
     }
 }
@@ -59,16 +63,28 @@ impl<'vir> PledgeExpr<'vir> {
         result: vir::ExprSnap<'vir>,
         args: impl IntoIterator<Item = T>,
     ) -> PledgeArgs<'vir> {
-        let all_args = args
+        let mut all_args: FxHashMap<mir::Local, _> = args
             .into_iter()
-            .map(|a| *a.borrow())
-            .chain([result])
-            .collect::<Vec<_>>();
-        vir::with_vcx(|vcx| PledgeArgs(vcx.alloc_slice(&all_args)))
+            .enumerate()
+            .map(|(idx, a)| ((idx + 1).into(), *a.borrow()))
+            .collect();
+        let result_local = (all_args.len() + 1).into();
+        all_args.insert(result_local, result);
+        vir::with_vcx(|vcx| PledgeArgs(vcx.alloc(all_args), result_local))
     }
 
     pub fn expr(&self, args: PledgeArgs<'vir>) -> vir::ExprBool<'vir> {
-        vir::with_vcx(|vcx| self.expr.reify(vcx, (self.did, args.0)))
+        vir::with_vcx(|vcx| {
+            self.expr
+                .reify(vcx, (self.did, args.0, vir::OldLabel::None))
+        })
+    }
+
+    pub fn expr_at_label(&self, args: PledgeArgs<'vir>, label: &'vir str) -> vir::ExprBool<'vir> {
+        vir::with_vcx(|vcx| {
+            self.expr
+                .reify(vcx, (self.did, args.0, vir::OldLabel::Label(label)))
+        })
     }
 
     pub fn span(&self) -> Span {
@@ -89,12 +105,35 @@ pub struct EncodedPledge<'vir> {
 
 #[derive(Clone)]
 pub struct MirSpecEncOutput<'vir> {
-    pub pres: Vec<vir::ExprBool<'vir>>,
-    pub posts: Vec<vir::ExprBool<'vir>>,
+    /// Each precondition paired with the source span of its spec item.
+    pub pres: Vec<(vir::ExprBool<'vir>, Span)>,
+    /// Each postcondition paired with the source span of its spec item.
+    pub posts: Vec<(vir::ExprBool<'vir>, Span)>,
     pub pledges: Vec<EncodedPledge<'vir>>,
-    pub pre_args: &'vir [vir::ExprSnap<'vir>],
+    pub pre_args: &'vir FxHashMap<mir::Local, vir::ExprSnap<'vir>>,
     #[allow(dead_code)]
-    pub post_args: &'vir [vir::ExprSnap<'vir>],
+    pub post_args: &'vir FxHashMap<mir::Local, vir::ExprSnap<'vir>>,
+}
+
+impl<'vir> MirSpecEncOutput<'vir> {
+    /// The precondition expressions, discarding their spans.
+    pub fn pre_exprs(&self) -> impl Iterator<Item = vir::ExprBool<'vir>> + '_ {
+        self.pres.iter().map(|(pre, _)| *pre)
+    }
+
+    /// The postcondition expressions, discarding their spans.
+    pub fn post_exprs(&self) -> impl Iterator<Item = vir::ExprBool<'vir>> + '_ {
+        self.posts.iter().map(|(post, _)| *post)
+    }
+}
+
+/// State shared by every spec encoded within one `MirSpecEnc` task.
+#[derive(Clone, Copy)]
+struct SpecEncCtx<'vir> {
+    extern_spec: Option<ExternSpecKind>,
+    enc_mode: MirSpecEncMode,
+    context_def_id: DefId,
+    substs: ty::GenericArgsRef<'vir>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -146,6 +185,21 @@ impl TaskEncoder for MirSpecEnc {
                 find_trait_method_substs(vcx.tcx(), context_def_id, context_params.rust_params())
                     .map(|s| s.1)
                     .unwrap_or(base_params.rust_params());
+            let substs = vcx.tcx().mk_args(substs);
+            let substs_for = |inherited: bool| {
+                // if the spec is not inherited and we are currently building the spec for the actual function we're encoding,
+                // do not use substitution
+                if !inherited && def_id == context_def_id {
+                    vcx.tcx().mk_args_from_iter(
+                        context_params
+                            .rust_params()
+                            .iter()
+                            .filter(|arg| arg.as_region().is_none()),
+                    )
+                } else {
+                    substs
+                }
+            };
 
             let local_defs = deps.require_dep::<crate::encoders::local_def::MirLocalDefEnc>(
                 MirLocalDefEncTask::LocalSubsts {
@@ -161,41 +215,56 @@ impl TaskEncoder for MirSpecEnc {
             )?;
             let specs = deps
                 .require_dep::<crate::encoders::SpecEnc>(crate::encoders::SpecEncTask { def_id })?;
+            let (pres, pres_inherited) = crate::encoders::spec_items(&specs.pres);
+            let (posts, posts_inherited) = crate::encoders::spec_items(&specs.posts);
+            let (pledges, pledges_inherited) = crate::encoders::spec_items(&specs.pledges);
+            let pre_ctx = SpecEncCtx {
+                extern_spec: specs.extern_spec,
+                enc_mode,
+                context_def_id,
+                substs: substs_for(pres_inherited),
+            };
+            let post_ctx = SpecEncCtx {
+                extern_spec: specs.extern_spec,
+                enc_mode,
+                context_def_id,
+                substs: substs_for(posts_inherited),
+            };
+            let pledge_ctx = SpecEncCtx {
+                extern_spec: specs.extern_spec,
+                enc_mode,
+                context_def_id,
+                substs: substs_for(pledges_inherited),
+            };
 
             let local_iter = (1..=local_defs.arg_count).map(mir::Local::from);
-            let all_args: Vec<vir::ExprSnap<'vir>> = match enc_mode {
+            let all_args: FxHashMap<mir::Local, _> = match enc_mode {
                 MirSpecEncMode::Impure => local_iter
-                    .map(|local| local_defs[local].impure_snap)
+                    .map(|local| (local, local_defs[local].impure_snap))
                     .collect(),
                 MirSpecEncMode::PureWithResult => {
                     let result_ty = local_defs[mir::RETURN_PLACE].local_snap.ty();
                     local_iter
-                        .map(|local| vcx.mk_local_ex(local_defs[local].local_snap))
-                        .chain([vcx.mk_result(result_ty)])
+                        .map(|local| (local, vcx.mk_local_ex(local_defs[local].local_snap)))
+                        .chain([((local_defs.arg_count + 1).into(), vcx.mk_result(result_ty))])
                         .collect()
                 }
                 MirSpecEncMode::PureWithoutResult => local_iter
-                    .map(|local| vcx.mk_local_ex(local_defs[local].local_snap))
-                    .chain([vcx.mk_local_ex(local_defs[mir::RETURN_PLACE].local_snap)])
+                    .map(|local| (local, vcx.mk_local_ex(local_defs[local].local_snap)))
+                    .chain([(
+                        (local_defs.arg_count + 1).into(),
+                        vcx.mk_local_ex(local_defs[mir::RETURN_PLACE].local_snap),
+                    )])
                     .collect(),
             };
-            let all_args = vcx.alloc_slice(&all_args);
-            let pre_args = match enc_mode {
-                MirSpecEncMode::Impure => all_args,
-                MirSpecEncMode::PureWithResult | MirSpecEncMode::PureWithoutResult => {
-                    &all_args[..all_args.len() - 1]
-                }
-            };
+            let all_args = vcx.alloc(all_args);
+            let pre_args = all_args; // it should be ok to provide more keys than required
 
-            let to_bool = deps
-                .require_dep::<TyUsePureEnc>(RustTyDecomposition::from_prim_ty(
-                    vcx.tcx().types.bool,
-                ))?
-                .expect_native()
-                .snap_to_prim;
-
-            let pres = specs
-                .pres
+            // Encode each functional precondition; if one cannot be encoded (e.g.
+            // it uses an unsupported feature), report the error at *that spec's*
+            // span and skip only it, keeping the permission contract and the other
+            // specs intact.
+            let pres: Vec<(vir::ExprBool<'_>, Span)> = pres
                 .iter()
                 .map(|spec_def_id| {
                     match deps
@@ -220,25 +289,29 @@ impl TaskEncoder for MirSpecEnc {
                         MirPureEncOutputPred(pred) => pred.reify(vcx, (*spec_def_id, pre_args)),
                     }
                 })
-                .collect::<Vec<vir::ExprBool<'_>>>();
+                .collect();
 
             let post_args = match enc_mode {
                 MirSpecEncMode::Impure => {
-                    let post_args: Vec<vir::ExprSnap<'vir>> = pre_args
+                    let post_args: FxHashMap<mir::Local, vir::ExprSnap<'vir>> = pre_args
                         .iter()
-                        .map(|arg| vcx.mk_old_expr(arg))
-                        .chain([local_defs[mir::RETURN_PLACE].impure_snap])
+                        .map(|(local, arg)| (*local, vcx.mk_old_expr(arg)))
+                        .chain([(
+                            (local_defs.arg_count + 1).into(),
+                            local_defs[mir::RETURN_PLACE].impure_snap,
+                        )])
                         .collect();
-                    vcx.alloc_slice(&post_args)
+                    vcx.alloc(post_args)
                 }
                 MirSpecEncMode::PureWithResult | MirSpecEncMode::PureWithoutResult => all_args,
             };
-            let posts = specs
-                .posts
+            let posts: Vec<(vir::ExprBool<'_>, Span)> = posts
                 .iter()
-                .map(|spec_def_id| {
-                    let span = vcx.tcx().def_span(spec_def_id);
+                .filter_map(|spec_def_id| {
+                    let span = vcx.tcx().def_span(*spec_def_id);
                     vcx.with_span(span, |vcx| {
+                        let spec =
+                            Self::encode_pure(vcx, deps, post_ctx, *spec_def_id, "postcondition")?;
                         vcx.handle_error("postcondition.violated:assertion.false", move |_| {
                             Some(vec![PrustiError::verification(
                                 "postcondition might not hold",
@@ -270,11 +343,10 @@ impl TaskEncoder for MirSpecEnc {
                         }
                     })
                 })
-                .collect::<Result<Vec<vir::ExprBool<'_>>, _>>()?;
-            let pledges = specs
-                .pledges
+                .collect();
+            let pledges = pledges
                 .iter()
-                .map(
+                .filter_map(
                     |Pledge {
                          lhs: lhs_def_id,
                          rhs: rhs_def_id,
@@ -326,13 +398,13 @@ impl TaskEncoder for MirSpecEnc {
                                     rhs_span.into(),
                                 )])
                             });
-                            to_bool.call()(rhs_expr).downcast_ty()
+                            rhs
                         });
                         let rhs_expr = PledgeExpr::new(*rhs_def_id, rhs_expr);
-                        EncodedPledge {
+                        Some(EncodedPledge {
                             expiry_obligation: lhs_expr,
                             expiry_postcondition: rhs_expr,
-                        }
+                        })
                     },
                 )
                 .collect::<Vec<_>>();
@@ -345,5 +417,37 @@ impl TaskEncoder for MirSpecEnc {
             };
             Ok(((), data))
         })
+    }
+}
+
+impl MirSpecEnc {
+    fn encode_pure<'vir>(
+        vcx: &'vir vir::VirCtxt<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+        ctx: SpecEncCtx<'vir>,
+        def_id: DefId,
+        type_: &str,
+    ) -> Option<MirPureEncOutput<'vir>> {
+        let span = vcx.tcx().def_span(def_id);
+        let spec = deps.require_dep::<MirPureEnc>(crate::encoders::MirPureEncTask {
+            encoding_depth: 0,
+            kind: PureKind::Spec {
+                context: ctx.context_def_id,
+                mode: ctx.enc_mode,
+            },
+            parent_def_id: def_id,
+            gargs: GArgs::new(
+                GParams::new_maybe_extern(ctx.context_def_id, ctx.extern_spec),
+                ctx.substs,
+            ),
+        });
+        spec.inspect_err(|err| {
+            let (message, err_span) = crate::encoders::mir_fn::dep_error(err);
+            vcx.emit_early_error(PrustiError::unsupported(
+                format!("cannot encode {type_}: {message}"),
+                err_span.unwrap_or(span).into(),
+            ))
+        })
+        .ok()
     }
 }

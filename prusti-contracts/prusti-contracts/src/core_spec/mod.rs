@@ -3,6 +3,7 @@ use crate::*;
 pub mod eq;
 pub mod float;
 pub mod ptr;
+pub mod slice;
 
 pub use eq::PureEq;
 
@@ -19,11 +20,13 @@ pub(super) mod type_eq {
 }
 
 #[extern_spec(core::panicking)]
+#[trusted]
 #[requires(false)]
 #[pure]
 fn panic(expr: &'static str) -> !;
 
 #[extern_spec(core::panicking)]
+#[trusted]
 #[requires(false)]
 pub fn assert_failed<T, U>(
     kind: core::panicking::AssertKind,
@@ -34,10 +37,3 @@ pub fn assert_failed<T, U>(
 where
     T: core::fmt::Debug + ?Sized,
     U: core::fmt::Debug + ?Sized;
-
-#[extern_spec]
-impl<T> [T] {
-    #[pure]
-    #[ensures(result == slice_len(self))]
-    fn len(&self) -> usize;
-}

@@ -1,13 +1,20 @@
+#![feature(allocator_api)]
+
 use prusti_contracts::*;
 
 #[extern_spec]
 impl<T> std::option::Option<T> {
+    #[trusted]
     #[pure]
     pub fn is_some(&self) -> bool;
 }
 
 #[extern_spec]
-impl<K, V, S: std::hash::BuildHasher> std::collections::HashMap<K, V, S> {
+impl<K, V, S: std::hash::BuildHasher, A> std::collections::HashMap<K, V, S, A>
+where
+    A: std::alloc::Allocator,
+{
+    #[trusted]
     #[pure]
     #[ensures(result.is_some() == self.contains_key(k))]
     pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<&V>
@@ -15,6 +22,7 @@ impl<K, V, S: std::hash::BuildHasher> std::collections::HashMap<K, V, S> {
         K: core::borrow::Borrow<Q> + std::cmp::Eq + std::hash::Hash,
         Q: core::hash::Hash + Eq;
 
+    #[trusted]
     #[pure]
     fn contains_key<Q: ?Sized>(&self, k: &Q) -> bool
     where
@@ -28,5 +36,4 @@ fn go(key: u32, m: &std::collections::HashMap<u32, bool>) {
     assert!(result.is_some())
 }
 
-fn main(){
-}
+fn main() {}

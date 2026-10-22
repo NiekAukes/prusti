@@ -1,8 +1,6 @@
 #![deny(unused_must_use)]
 #![feature(box_patterns)]
 #![feature(proc_macro_span)]
-#![feature(if_let_guard)]
-#![feature(assert_matches)]
 // This Clippy chcek seems to be always wrong.
 #![allow(clippy::iter_with_drain)]
 #![warn(clippy::disallowed_types)]
@@ -56,9 +54,21 @@ macro_rules! result_to_tokens {
     }};
 }
 
+/// The argument of an attribute in inner position, i.e. its tokens with the
+/// surrounding parenthesis dropped. This makes them identical to the ones
+/// passed by the native procedural macro call.
+fn unwrap_argument(tokens: TokenStream) -> TokenStream {
+    let mut iter = tokens.into_iter();
+    let Some(TokenTree::Group(group)) = iter.next() else {
+        unreachable!("Unexpected shape of an attribute.")
+    };
+    assert!(iter.next().is_none(), "Unexpected shape of an attribute.");
+    group.stream()
+}
+
 fn extract_prusti_attributes(
     item: &mut untyped::AnyFnItem,
-) -> Vec<(SpecAttributeKind, TokenStream)> {
+) -> Vec<(SpecAttributeKind, Span, TokenStream)> {
     let mut prusti_attributes = Vec::new();
     let mut regular_attributes = Vec::new();
     for attr in item.attrs_mut().drain(0..) {
@@ -67,21 +77,18 @@ fn extract_prusti_attributes(
         {
             let idx = attr.path.segments.len() - 1;
             if let Ok(attr_kind) = attr.path.segments[idx].ident.to_string().try_into() {
+                // The span of the annotation itself, so diagnostics can point
+                // at the specific attribute rather than the whole item.
+                let attr_span = attr.path.span();
                 let tokens = match attr_kind {
                     SpecAttributeKind::Requires
                     | SpecAttributeKind::Ensures
                     | SpecAttributeKind::AfterExpiry
                     | SpecAttributeKind::AssertOnExpiry
-                    | SpecAttributeKind::RefineSpec => {
-                        // We need to drop the surrounding parenthesis to make the
-                        // tokens identical to the ones passed by the native procedural
-                        // macro call.
-                        let mut iter = attr.tokens.into_iter();
-                        let TokenTree::Group(group) = iter.next().unwrap() else {
-                            unreachable!()
-                        };
-                        assert!(iter.next().is_none(), "Unexpected shape of an attribute.");
-                        group.stream()
+                    | SpecAttributeKind::RefineSpec => unwrap_argument(attr.tokens),
+                    // The argument of `terminates` is optional.
+                    SpecAttributeKind::Terminates if !attr.tokens.is_empty() => {
+                        unwrap_argument(attr.tokens)
                     }
                     // Nothing to do for attributes without arguments.
                     SpecAttributeKind::Pure
@@ -98,7 +105,7 @@ fn extract_prusti_attributes(
                         unreachable!("print_counterexample on function")
                     }
                 };
-                prusti_attributes.push((attr_kind, tokens));
+                prusti_attributes.push((attr_kind, attr_span, tokens));
             } else {
                 regular_attributes.push(attr);
             }
@@ -121,8 +128,9 @@ pub fn rewrite_prusti_attributes(
 ) -> TokenStream {
     let mut item: untyped::AnyFnItem = handle_result!(syn::parse2(item_tokens));
 
-    // Start with the outer attribute
-    let mut prusti_attributes = vec![(outer_attr_kind, outer_attr_tokens)];
+    // Start with the outer attribute. It is the one the compiler ran as the
+    // procedural macro, so its span is the call site.
+    let mut prusti_attributes = vec![(outer_attr_kind, Span::call_site(), outer_attr_tokens)];
 
     // Collect the remaining Prusti attributes, removing them from `item`.
     prusti_attributes.extend(extract_prusti_attributes(&mut item));
@@ -130,7 +138,7 @@ pub fn rewrite_prusti_attributes(
     // make sure to also update the check in the predicate! handling method
     if prusti_attributes
         .iter()
-        .any(|(ak, _)| ak == &SpecAttributeKind::Predicate)
+        .any(|(ak, _, _)| ak == &SpecAttributeKind::Predicate)
     {
         return syn::Error::new(
             item.span(),
@@ -154,22 +162,26 @@ type GeneratedResult = syn::Result<(Vec<syn::Item>, Vec<syn::Attribute>)>;
 
 /// Generate spec items and attributes for `item` from the Prusti attributes
 fn generate_spec_and_assertions(
-    mut prusti_attributes: Vec<(SpecAttributeKind, TokenStream)>,
+    mut prusti_attributes: Vec<(SpecAttributeKind, Span, TokenStream)>,
     item: &untyped::AnyFnItem,
 ) -> GeneratedResult {
     let mut generated_items = vec![];
     let mut generated_attributes = vec![];
 
-    for (attr_kind, attr_tokens) in prusti_attributes.drain(..) {
+    for (attr_kind, attr_span, attr_tokens) in prusti_attributes.drain(..) {
         let rewriting_result = match attr_kind {
-            SpecAttributeKind::Requires => generate_for_requires(attr_tokens, item),
-            SpecAttributeKind::Ensures => generate_for_ensures(attr_tokens, item),
-            SpecAttributeKind::AfterExpiry => generate_for_after_expiry(attr_tokens, item),
-            SpecAttributeKind::AssertOnExpiry => generate_for_assert_on_expiry(attr_tokens, item),
-            SpecAttributeKind::Pure => generate_for_pure(attr_tokens, item),
-            SpecAttributeKind::Verified => generate_for_verified(attr_tokens, item),
-            SpecAttributeKind::Terminates => generate_for_terminates(attr_tokens, item),
-            SpecAttributeKind::Trusted => generate_for_trusted(attr_tokens, item),
+            SpecAttributeKind::Requires => generate_for_requires(attr_tokens, attr_span, item),
+            SpecAttributeKind::Ensures => generate_for_ensures(attr_tokens, attr_span, item),
+            SpecAttributeKind::AfterExpiry => {
+                generate_for_after_expiry(attr_tokens, attr_span, item)
+            }
+            SpecAttributeKind::AssertOnExpiry => {
+                generate_for_assert_on_expiry(attr_tokens, attr_span, item)
+            }
+            SpecAttributeKind::Pure => generate_for_pure(attr_tokens, attr_span, item),
+            SpecAttributeKind::Verified => generate_for_verified(attr_tokens, attr_span, item),
+            SpecAttributeKind::Terminates => generate_for_terminates(attr_tokens, attr_span, item),
+            SpecAttributeKind::Trusted => generate_for_trusted(attr_tokens, attr_span, item),
             // Predicates are handled separately below; the entry in the SpecAttributeKind enum
             // only exists so we successfully parse it and emit an error in
             // `check_incompatible_attrs`; so we'll never reach here.
@@ -188,7 +200,11 @@ fn generate_spec_and_assertions(
 }
 
 /// Generate spec items and attributes to typecheck the and later retrieve "requires" annotations.
-fn generate_for_requires(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_requires(
+    attr: TokenStream,
+    span: Span,
+    item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     let mut rewriter = rewriter::AstRewriter::new();
     let spec_id = rewriter.generate_spec_id();
     let spec_id_str = spec_id.to_string();
@@ -196,14 +212,18 @@ fn generate_for_requires(attr: TokenStream, item: &untyped::AnyFnItem) -> Genera
         rewriter.process_assertion(rewriter::SpecItemType::Precondition, spec_id, attr, item)?;
     Ok((
         vec![spec_item],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::pre_spec_id_ref = #spec_id_str]
         }],
     ))
 }
 
 /// Generate spec items and attributes to typecheck the and later retrieve "ensures" annotations.
-fn generate_for_ensures(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_ensures(
+    attr: TokenStream,
+    span: Span,
+    item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     let mut rewriter = rewriter::AstRewriter::new();
     let spec_id = rewriter.generate_spec_id();
     let spec_id_str = spec_id.to_string();
@@ -211,28 +231,36 @@ fn generate_for_ensures(attr: TokenStream, item: &untyped::AnyFnItem) -> Generat
         rewriter.process_assertion(rewriter::SpecItemType::Postcondition, spec_id, attr, item)?;
     Ok((
         vec![spec_item],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::post_spec_id_ref = #spec_id_str]
         }],
     ))
 }
 
 /// Generate spec items and attributes to typecheck and later retrieve "after_expiry" annotations.
-fn generate_for_after_expiry(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_after_expiry(
+    attr: TokenStream,
+    span: Span,
+    item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     let mut rewriter = rewriter::AstRewriter::new();
     let spec_id = rewriter.generate_spec_id();
     let spec_id_str = spec_id.to_string();
     let spec_item = rewriter.process_pledge(spec_id, attr, item)?;
     Ok((
         vec![spec_item],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::pledge_spec_id_ref = #spec_id_str]
         }],
     ))
 }
 
 /// Generate spec items and attributes to typecheck and later retrieve "after_expiry" annotations.
-fn generate_for_assert_on_expiry(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_assert_on_expiry(
+    attr: TokenStream,
+    span: Span,
+    item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     let mut rewriter = rewriter::AstRewriter::new();
     let spec_id_lhs = rewriter.generate_spec_id();
     let spec_id_lhs_str = spec_id_lhs.to_string();
@@ -243,10 +271,10 @@ fn generate_for_assert_on_expiry(attr: TokenStream, item: &untyped::AnyFnItem) -
     Ok((
         vec![spec_item_lhs, spec_item_rhs],
         vec![
-            parse_quote_spanned! {item.span()=>
+            parse_quote_spanned! {span=>
                 #[prusti::assert_pledge_spec_id_ref_lhs = #spec_id_lhs_str]
             },
-            parse_quote_spanned! {item.span()=>
+            parse_quote_spanned! {span=>
                 #[prusti::assert_pledge_spec_id_ref_rhs = #spec_id_rhs_str]
             },
         ],
@@ -254,9 +282,13 @@ fn generate_for_assert_on_expiry(attr: TokenStream, item: &untyped::AnyFnItem) -
 }
 
 /// Generate spec items and attributes to typecheck and later retrieve "terminates" annotations.
-fn generate_for_terminates(mut attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_terminates(
+    mut attr: TokenStream,
+    span: Span,
+    item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     if attr.is_empty() {
-        attr = quote! { Int::new(1) };
+        attr = quote! { Int::from(1) };
     } else {
         let mut attr_iter = attr.clone().into_iter();
         let first = attr_iter.next();
@@ -275,14 +307,14 @@ fn generate_for_terminates(mut attr: TokenStream, item: &untyped::AnyFnItem) -> 
 
     Ok((
         vec![spec_item],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::terminates_spec_id_ref = #spec_id_str]
         }],
     ))
 }
 
 /// Generate spec items and attributes to typecheck and later retrieve "pure" annotations.
-fn generate_for_pure(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_pure(attr: TokenStream, span: Span, _item: &untyped::AnyFnItem) -> GeneratedResult {
     if !attr.is_empty() {
         return Err(syn::Error::new(
             attr.span(),
@@ -292,14 +324,18 @@ fn generate_for_pure(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedR
 
     Ok((
         vec![],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::pure]
         }],
     ))
 }
 
 /// Generate spec items and attributes to typecheck and later retrieve "verified" annotations.
-fn generate_for_verified(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_verified(
+    attr: TokenStream,
+    span: Span,
+    _item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     if !attr.is_empty() {
         return Err(syn::Error::new(
             attr.span(),
@@ -309,7 +345,7 @@ fn generate_for_verified(attr: TokenStream, item: &untyped::AnyFnItem) -> Genera
 
     Ok((
         vec![],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::verified]
         }],
     ))
@@ -331,7 +367,11 @@ fn generate_for_pure_refinements(item: &untyped::AnyFnItem) -> GeneratedResult {
 }
 
 /// Generate spec items and attributes to typecheck and later retrieve "trusted" annotations.
-fn generate_for_trusted(attr: TokenStream, item: &untyped::AnyFnItem) -> GeneratedResult {
+fn generate_for_trusted(
+    attr: TokenStream,
+    span: Span,
+    _item: &untyped::AnyFnItem,
+) -> GeneratedResult {
     if !attr.is_empty() {
         return Err(syn::Error::new(
             attr.span(),
@@ -341,7 +381,7 @@ fn generate_for_trusted(attr: TokenStream, item: &untyped::AnyFnItem) -> Generat
 
     Ok((
         vec![],
-        vec![parse_quote_spanned! {item.span()=>
+        vec![parse_quote_spanned! {span=>
             #[prusti::trusted]
         }],
     ))
@@ -454,38 +494,186 @@ fn generate_expression_closure(
     }
 }
 
+/// Rejects `result` as a binding anywhere in a closure parameter pattern: it
+/// would collide with the postcondition closure's `result` parameter.
+fn check_no_result_binding(pat: &syn::Pat) -> syn::Result<()> {
+    struct FindResult(Option<Span>);
+    impl<'ast> syn::visit::Visit<'ast> for FindResult {
+        fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+            if self.0.is_none() && pat.ident == "result" {
+                self.0 = Some(pat.ident.span());
+            }
+            syn::visit::visit_pat_ident(self, pat);
+        }
+    }
+    let mut visitor = FindResult(None);
+    syn::visit::Visit::visit_pat(&mut visitor, pat);
+    match visitor.0 {
+        Some(span) => Err(syn::Error::new(
+            span,
+            "closure parameter bindings may not be named `result`",
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The value of a closure parameter, rebuilt from its pattern's bindings for
+/// the `closure_spec_*` marker tuples. The value sits in dead code and only
+/// pins the spec closures' parameter types, but it must typecheck: a pattern
+/// without `..` and without `ref` bindings binds everything it matches, so
+/// its value can be rebuilt structurally (moving the bindings, which the
+/// diverging `return` permits).
+///
+/// `_` binds nothing, and nothing can mention it either, but the stand-in
+/// value must still typecheck at its position. In a structural position
+/// (a tuple slot, behind `&`, or the parameter itself) the expected type is
+/// whatever we build, so `()` serves. In a `pinned` position (the field of
+/// a struct the pattern names, or an array's element type, unified with the
+/// sibling elements) no stand-in can be right: the field's type is fixed
+/// by a definition this macro cannot see, so `()` mismatches a concrete
+/// field, while an inference variable (`None.unwrap()`) is unresolvable
+/// when `_` is all that constrains a generic one. Such a `_` is therefore
+/// rejected; binding the value instead (`_x`) is exact in both cases.
+fn reconstruct_arg(pat: &syn::Pat, pinned: bool) -> syn::Result<TokenStream> {
+    let unsupported = |span, what: &str| {
+        syn::Error::new(
+            span,
+            format!("the parameters of a closure with specifications may not contain {what}"),
+        )
+    };
+    match pat {
+        syn::Pat::Ident(pat_ident) => {
+            if let Some(by_ref) = &pat_ident.by_ref {
+                return Err(unsupported(by_ref.span(), "`ref` bindings"));
+            }
+            // An `x @ subpattern` binding names the whole value, whatever
+            // the subpattern is.
+            let ident = &pat_ident.ident;
+            Ok(quote_spanned! {ident.span()=> #ident })
+        }
+        syn::Pat::Wild(wild) if pinned => Err(unsupported(
+            wild.span(),
+            "`_` inside a struct or array pattern (bind the value instead, e.g. `_x`)",
+        )),
+        syn::Pat::Wild(wild) => Ok(quote_spanned! {wild.span()=> () }),
+        // A tuple (or reference) type is structural: if the position of the
+        // whole is pinned, so is each slot, and vice versa.
+        syn::Pat::Tuple(tuple) => {
+            let elems = tuple
+                .elems
+                .iter()
+                .map(|elem| reconstruct_arg(elem, pinned))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote_spanned! {tuple.span()=> (#(#elems,)*) })
+        }
+        syn::Pat::Reference(reference) => {
+            let mutability = &reference.mutability;
+            let value = reconstruct_arg(&reference.pat, pinned)?;
+            Ok(quote_spanned! {reference.span()=> &#mutability #value })
+        }
+        // A constructor is a nominal signature: its fields' types are fixed
+        // by the struct definition, whatever the position of the whole.
+        syn::Pat::TupleStruct(tuple_struct) => {
+            let path = &tuple_struct.path;
+            let elems = tuple_struct
+                .pat
+                .elems
+                .iter()
+                .map(|elem| reconstruct_arg(elem, true))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote_spanned! {tuple_struct.span()=> #path(#(#elems),*) })
+        }
+        syn::Pat::Struct(pat_struct) => {
+            if let Some(dot2) = &pat_struct.dot2_token {
+                return Err(unsupported(dot2.span(), "`..`"));
+            }
+            let path = &pat_struct.path;
+            let fields = pat_struct
+                .fields
+                .iter()
+                .map(|field| {
+                    let member = &field.member;
+                    let value = reconstruct_arg(&field.pat, true)?;
+                    Ok(quote_spanned! {field.span()=> #member: #value })
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote_spanned! {pat_struct.span()=> #path { #(#fields),* } })
+        }
+        // A slice pattern in parameter position matches an array (on a slice
+        // it would be refutable, which rustc rejects on its own), so the
+        // value is an array literal. The elements share one type, so each
+        // slot is pinned by its siblings.
+        syn::Pat::Slice(slice) => {
+            let elems = slice
+                .elems
+                .iter()
+                .map(|elem| reconstruct_arg(elem, true))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote_spanned! {slice.span()=> [#(#elems),*] })
+        }
+        // A unit struct: the path is the value.
+        syn::Pat::Path(path) => Ok(path.to_token_stream()),
+        syn::Pat::Type(pat_type) => reconstruct_arg(&pat_type.pat, pinned),
+        syn::Pat::Rest(rest) => Err(unsupported(rest.span(), "`..`")),
+        other => Err(unsupported(other.span(), "this kind of pattern")),
+    }
+}
+
+/// Expands the `closure!` macro: returns the closure itself, with its specs
+/// embedded as `closure_spec_*` marker calls in dead `if false { return .. }`
+/// blocks inside the body (the `return` makes the argument moves diverge, so
+/// they cannot affect the body), one block per specification. For
+///
+/// ```ignore
+/// closure!(#[requires(P1)] #[requires(P2)] #[ensures(Q)] |a: A, b| body)
+/// ```
+///
+/// the macro expands to
+///
+/// ```ignore
+/// {
+///     #[prusti::closure]
+///     #[prusti::specs_version = "..."]
+///     let _prusti_closure = |a: A, b| {
+///         if false {
+///             return closure_spec_pre((a, b), #[prusti::spec_only] |a: _, b: _| -> bool { P1 });
+///         }
+///         if false {
+///             return closure_spec_pre((a, b), #[prusti::spec_only] |a: _, b: _| -> bool { P2 });
+///         }
+///         let prusti_closure_args = ::core::marker::PhantomData;    // mixed-site hygiene
+///         if false {
+///             return closure_spec_args((a, b, None.unwrap()), prusti_closure_args);
+///         }
+///         let result = body;
+///         if false {
+///             return closure_spec_post((None.unwrap(), None.unwrap(), result), prusti_closure_args, #[prusti::spec_only] |a: _, b: _, result| -> bool { Q });
+///         }
+///         result
+///     };
+///     _prusti_closure
+/// }
+/// ```
+///
+/// Each spec closure carries the span of its specification, so that
+/// diagnostics point at the violated clause.
+///
+/// The spec closures take the closure's parameters (plus `result` for
+/// postconditions) as a flat list of the parameters' own patterns; their
+/// types are deduced from the markers' `Fn<Args>` bound against the actual
+/// argument tuple, never from annotations (see [reconstruct_arg]: a `_`
+/// slot's stand-in value deliberately fakes its type, so a user annotation
+/// must not be forwarded). The argument tuple holds each parameter's value,
+/// rebuilt from the pattern's bindings for parameters that destructure.
+/// `closure_spec_args` unifies the `PhantomData` binding
+/// carrying the argument (and result) types from the closure entry to the
+/// postcondition; tuple slots whose values are unavailable at the
+/// respective marker are filled with `None.unwrap()`, which mints a fresh
+/// inference variable (a `!`-typed stand-in such as `unreachable!()` wouldn't
+/// work as it doesn't coerce at that point and would pin the slot to `!`).
 pub fn closure(tokens: TokenStream) -> TokenStream {
     let cl_spec: ClosureWithSpec = handle_result!(syn::parse(tokens.into()));
     let callsite_span = Span::call_site();
-
-    let mut rewriter = rewriter::AstRewriter::new();
-
-    let mut preconds: Vec<(SpecificationId, syn::Expr)> = vec![];
-    let mut postconds: Vec<(SpecificationId, syn::Expr)> = vec![];
-
-    let mut cl_annotations = TokenStream::new();
-
-    for r in cl_spec.pres {
-        let spec_id = rewriter.generate_spec_id();
-        let precond =
-            handle_result!(rewriter.process_closure_assertion(spec_id, r.to_token_stream(),));
-        preconds.push((spec_id, precond));
-        let spec_id_str = spec_id.to_string();
-        cl_annotations.extend(quote_spanned! {callsite_span=>
-            #[prusti::pre_spec_id_ref = #spec_id_str]
-        });
-    }
-
-    for e in cl_spec.posts {
-        let spec_id = rewriter.generate_spec_id();
-        let postcond =
-            handle_result!(rewriter.process_closure_assertion(spec_id, e.to_token_stream(),));
-        postconds.push((spec_id, postcond));
-        let spec_id_str = spec_id.to_string();
-        cl_annotations.extend(quote_spanned! {callsite_span=>
-            #[prusti::post_spec_id_ref = #spec_id_str]
-        });
-    }
 
     let syn::ExprClosure {
         attrs,
@@ -499,43 +687,137 @@ pub fn closure(tokens: TokenStream) -> TokenStream {
         body,
     } = cl_spec.cl;
 
-    let output_type: syn::Type = match output {
-        syn::ReturnType::Default => {
-            return syn::Error::new(output.span(), "closure must specify return type")
-                .to_compile_error();
-        }
-        syn::ReturnType::Type(_, ref ty) => (**ty).clone(),
-    };
-
-    let (spec_toks_pre, spec_toks_post) =
-        handle_result!(rewriter.process_closure(inputs.clone(), output_type, preconds, postconds,));
-
     let mut attrs_ts = TokenStream::new();
     for a in attrs {
-        attrs_ts.extend(a.into_token_stream());
+        match a.path.get_ident() {
+            Some(ident) if ident == "pure" => {
+                attrs_ts.extend(quote_spanned! {a.span()=> #[prusti::pure] });
+            }
+            Some(ident) if ident == "trusted" => {
+                attrs_ts.extend(quote_spanned! {a.span()=> #[prusti::trusted] });
+            }
+            // Reject other specification attributes rather than forwarding
+            // them (they would be silently ignored on the `let` binding).
+            Some(ident) if SpecAttributeKind::try_from(ident.to_string()).is_ok() => {
+                return syn::Error::new(
+                    a.span(),
+                    format!("`{ident}` is not supported on `closure!`"),
+                )
+                .to_compile_error();
+            }
+            _ => attrs_ts.extend(a.into_token_stream()),
+        }
     }
+
+    // Each specification with its span, so that the spec closure carries the
+    // span of its expression and diagnostics point at that clause.
+    let parse_specs = |exprs: Vec<syn::Expr>| -> syn::Result<Vec<(TokenStream, Span)>> {
+        exprs
+            .into_iter()
+            .map(|expr| Ok((parse_prusti(expr.to_token_stream())?, expr.span())))
+            .collect()
+    };
+    let pres = handle_result!(parse_specs(cl_spec.pres));
+    let posts = handle_result!(parse_specs(cl_spec.posts));
+
+    // The spec closures' parameters (the closure's own patterns) and the
+    // parameters' values for the marker tuples (rebuilt from the patterns'
+    // bindings). The parameter types are deliberately left to inference:
+    // each is pinned by its value, and for a pattern with `_` slots the
+    // value's type differs from the closure's (the slots hold `()`), so a
+    // user annotation must not be forwarded.
+    let mut spec_params: Vec<TokenStream> = vec![];
+    let mut arg_values: Vec<TokenStream> = vec![];
+    if !pres.is_empty() || !posts.is_empty() {
+        for input in &inputs {
+            let pat = match input {
+                syn::Pat::Type(pat_type) => &*pat_type.pat,
+                other => other,
+            };
+            handle_result!(check_no_result_binding(pat));
+            arg_values.push(handle_result!(reconstruct_arg(pat, false)));
+            spec_params.push(quote_spanned! {callsite_span=> #pat: _ });
+        }
+    }
+
+    let anys = arg_values
+        .iter()
+        .map(|_| quote_spanned! {callsite_span=> ::core::option::Option::None.unwrap() })
+        .collect::<Vec<_>>();
+    let result_param = match &output {
+        syn::ReturnType::Type(_, ty) => quote_spanned! {callsite_span=> result: #ty },
+        syn::ReturnType::Default => quote_spanned! {callsite_span=> result },
+    };
+
+    // Hygienic: user code inside the closure body cannot refer to this binding.
+    let args_ident = syn::Ident::new("prusti_closure_args", Span::mixed_site());
+
+    let pre_stmts = pres.iter().map(|(pre, span)| {
+        let spec_closure = quote_spanned! {*span=>
+            #[prusti::spec_only]
+            |#(#spec_params),*| -> bool { #pre }
+        };
+        quote_spanned! {callsite_span=>
+            #[allow(unused_must_use, unused_variables, unused_braces, unused_parens)]
+            if false {
+                return ::prusti_contracts::closure_spec_pre((#(#arg_values,)*), #spec_closure);
+            }
+        }
+    });
+
+    // The `PhantomData` tie is only needed (and only typechecks, its result
+    // slot being pinned by the post markers alone) when there are
+    // postconditions.
+    let body = if posts.is_empty() {
+        body.to_token_stream()
+    } else {
+        let post_stmts = posts.iter().map(|(post, span)| {
+            let spec_closure = quote_spanned! {*span=>
+                #[prusti::spec_only]
+                |#(#spec_params,)* #result_param| -> bool { #post }
+            };
+            quote_spanned! {callsite_span=>
+                #[allow(unused_must_use, unused_variables, unused_braces, unused_parens)]
+                if false {
+                    return ::prusti_contracts::closure_spec_post(
+                        (#(#anys,)* result,),
+                        #args_ident,
+                        #spec_closure,
+                    );
+                }
+            }
+        });
+        quote_spanned! {callsite_span=>
+            let #args_ident = ::core::marker::PhantomData;
+            #[allow(unused_must_use, unused_braces, unused_parens)]
+            if false {
+                return ::prusti_contracts::closure_spec_args(
+                    (#(#arg_values,)* ::core::option::Option::None.unwrap(),),
+                    #args_ident,
+                );
+            }
+            let result = #body;
+            #(#post_stmts)*
+            result
+        }
+    };
+    let new_body = quote_spanned! {callsite_span=>
+        {
+            #(#pre_stmts)*
+            #body
+        }
+    };
 
     quote_spanned! {callsite_span=>
         {
             #[allow(unused_variables, unused_braces, unused_parens)]
             #[prusti::closure]
             #[prusti::specs_version = #SPECS_VERSION]
-            #cl_annotations #attrs_ts
+            #attrs_ts
             let _prusti_closure =
                 #asyncness #movability #capture
                 #or1_token #inputs #or2_token #output
-                {
-                    #[allow(unused_must_use, unused_braces, unused_parens)]
-                    if false {
-                        #spec_toks_pre
-                    }
-                    let result = #body ;
-                    #[allow(unused_must_use, unused_braces, unused_parens)]
-                    if false {
-                        #spec_toks_post
-                    }
-                    result
-                };
+                #new_body;
             _prusti_closure
         }
     }
@@ -565,8 +847,8 @@ pub fn refine_trait_spec(_attr: TokenStream, tokens: TokenStream) -> TokenStream
 
                 let illegal_attribute_span = prusti_attributes
                     .iter()
-                    .filter(|(kind, _)| kind == &SpecAttributeKind::RefineSpec)
-                    .map(|(_, tokens)| tokens.span())
+                    .filter(|(kind, _, _)| kind == &SpecAttributeKind::RefineSpec)
+                    .map(|(_, _, tokens)| tokens.span())
                     .next();
                 if let Some(span) = illegal_attribute_span {
                     let err = Err(syn::Error::new(
@@ -625,6 +907,7 @@ pub fn refine_trait_spec(_attr: TokenStream, tokens: TokenStream) -> TokenStream
     impl_block.items = new_items;
     quote_spanned! {impl_block.span()=>
         #(#generated_spec_items)*
+        #[prusti::refine_trait_spec]
         #[prusti::specs_version = #SPECS_VERSION]
         #impl_block
     }
@@ -837,7 +1120,7 @@ pub fn rewrite_prusti_attributes_for_types(
     }
 
     // we order the attributes to ensure a model attribute is processed first
-    prusti_attributes.sort_by(|(ak1, _), (ak2, _)| ak1.cmp(ak2));
+    prusti_attributes.sort_by_key(|(ak1, _)| *ak1);
 
     let (generated_spec_items, generated_attributes) = handle_result!(
         generate_spec_and_assertions_for_types(prusti_attributes, &mut item)
@@ -1017,22 +1300,11 @@ pub fn ghost(tokens: TokenStream) -> TokenStream {
     let spec_id = rewriter.generate_spec_id();
     let spec_id_str = spec_id.to_string();
 
-    let make_closure = |kind| {
-        quote! {
-            #[allow(unused_must_use, unused_variables, unused_braces, unused_parens)]
-            if false {
-                #[prusti::spec_only]
-                #[prusti::#kind]
-                #[prusti::spec_id = #spec_id_str]
-                || -> () {};
-            }
-        }
-    };
-
     struct Visitor {
         loops: Vec<(Option<syn::Ident>, Span)>,
         breaks: Vec<(Option<syn::Ident>, Span)>,
         returns: Option<Span>,
+        tries: Vec<Span>,
     }
 
     impl<'ast> Visit<'ast> for Visitor {
@@ -1073,12 +1345,23 @@ pub fn ghost(tokens: TokenStream) -> TokenStream {
             let e = e.clone();
             self.returns = Some(e.span());
         }
+        // `?` exits the enclosing function like `return` does.
+        fn visit_expr_try(&mut self, ex: &'ast syn::ExprTry) {
+            self.tries.push(ex.span());
+            syn::visit::visit_expr_try(self, ex);
+        }
+        // Do not descend into nested closures or items: `return`/`?` (and
+        // loops) inside them are local to the closure/item and do not leave
+        // the ghost block.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
     }
 
     let mut visitor = Visitor {
         loops: vec![],
         breaks: vec![],
         returns: None,
+        tries: vec![],
     };
 
     let tokens = quote! {
@@ -1090,6 +1373,7 @@ pub fn ghost(tokens: TokenStream) -> TokenStream {
     visitor.visit_block(&input);
 
     let mut exit_errors = visitor.returns.into_iter().collect::<Vec<_>>();
+    exit_errors.extend(visitor.tries);
 
     'breaks: for (break_label, break_span) in visitor.breaks.iter() {
         for (loop_label, loop_span) in visitor.loops.iter() {
@@ -1103,17 +1387,28 @@ pub fn ghost(tokens: TokenStream) -> TokenStream {
         exit_errors.push(*break_span);
     }
 
-    let begin = make_closure(quote! {ghost_begin});
-    let end = make_closure(quote! {ghost_end});
-
+    // The ghost body lives in dead code, so it is pruned before codegen; the
+    // live path merely constructs the `Ghost` ZST. The body appears twice:
+    // inline (encoded for verification) and duplicated into a never-called
+    // closure so that the compiler checks it complies with `Fn` capture rules
+    // (no mutation or consumption of outer variables); `ghost_call`'s
+    // signature unifies the types of the two copies. The `if`/`else` unifies
+    // the types of the two arms, giving `ghost_erased()` the body's type.
     if exit_errors.is_empty() {
         quote_spanned! {callsite_span=>
-            {
-                #begin
-                #[prusti::specs_version = #SPECS_VERSION]
-                let ghost_result = Ghost::new(#tokens);
-                #end
-                ghost_result
+            #[allow(unused_must_use, unused_variables, unused_braces, unused_parens)]
+            if false {
+                ::prusti_contracts::ghost_call(
+                    &(
+                        #[prusti::spec_only]
+                        #[prusti::spec_id = #spec_id_str]
+                        #[prusti::specs_version = #SPECS_VERSION]
+                        || {#tokens}
+                    ),
+                    {#tokens},
+                )
+            } else {
+                ::prusti_contracts::ghost_erased()
             }
         }
     } else {

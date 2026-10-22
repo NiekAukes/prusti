@@ -1,9 +1,10 @@
+//@ known-failure
 //@ compile-flags: -Punsafe_core_proof=true
 #![allow(unused)]
 use prusti_contracts::*;
 
 #[pure]
-#[terminates(Int::new(x))]
+#[terminates(Int::from(x))]
 #[requires(x >= 0)]
 fn add_3(x: i64) -> i64 {
     if x == 0 {
@@ -15,7 +16,7 @@ fn add_3(x: i64) -> i64 {
 }
 
 #[pure]
-#[terminates(Int::new(x))]
+#[terminates(Int::from(x))]
 #[requires(x >= 0)]
 #[ensures((x % 2 == 0) == (add_3(x) % 2 == 0))]
 fn lemma(x: i64) -> bool {

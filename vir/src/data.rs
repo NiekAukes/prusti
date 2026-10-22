@@ -25,6 +25,8 @@ pub struct LocalDeclData<'vir, T: CompType> {
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
 pub enum UnOpKind {
     Neg,
+    /// Negation of a `Perm` (real) value.
+    PermNeg,
     Not,
 }
 impl From<mir::UnOp> for UnOpKind {
@@ -57,8 +59,11 @@ pub enum BinOpKind {
     Sub,
     Mul,
     Div,
-    DivRational,
-    DivRationalRational,
+    // Arithmetic on `Perm` (real) values.
+    PermAdd,
+    PermSub,
+    PermMul,
+    PermPermDiv,
     Mod,
     // Set ops
     SetUnion,
@@ -108,11 +113,43 @@ impl From<&mir::BinOp> for BinOpKind {
     }
 }
 
+/// A binary operation on a native Viper collection. Separate from
+/// [`BinOpKind`] since the operands are heterogeneously typed and the exact
+/// operation (and result type) is determined by the collection operand's
+/// type. Each variant corresponds to one Viper surface syntax form.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
+pub enum CollectionBinOpKind {
+    /// `(lhs in rhs)`: membership of `lhs` in a `Set`/`Seq` or among a
+    /// `Map`'s keys (a `Bool`), or its multiplicity in a `Multiset` (an
+    /// `Int`). The collection is always `rhs`.
+    Contains,
+    /// `(lhs union rhs)`
+    Union,
+    /// `(lhs intersection rhs)`
+    Intersection,
+    /// `(lhs setminus rhs)`
+    Difference,
+    /// `(lhs subset rhs)`
+    Subset,
+    /// `(lhs ++ rhs)`: `Seq` concatenation.
+    Concat,
+    /// `lhs[rhs]`: `Seq` indexing or `Map` lookup.
+    Index,
+    /// `lhs[..rhs]`: the first `rhs` elements of the `Seq` `lhs`. A
+    /// two-sided slice `s[a..b]` is not a single Viper operation; it is
+    /// composed as a `Take` followed by a `Drop`.
+    Take,
+    /// `lhs[rhs..]`: all but the first `rhs` elements of the `Seq` `lhs`.
+    Drop,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 pub enum ConstData {
     Bool(bool),
     Int(u128), // TODO: what about negative numbers? larger numbers?
     Wildcard,
+    NoPerm,
+    FullPerm,
     Null,
 }
 
@@ -121,7 +158,9 @@ impl ConstData {
         match self {
             ConstData::Bool(_) => crate::TYPE_BOOL.upcast_ty(),
             ConstData::Int(_) => crate::TYPE_INT.upcast_ty(),
-            ConstData::Wildcard => crate::TYPE_PERM.upcast_ty(),
+            ConstData::Wildcard | ConstData::NoPerm | ConstData::FullPerm => {
+                crate::TYPE_PERM.upcast_ty()
+            }
             ConstData::Null => crate::TYPE_REF.upcast_ty(),
         }
     }
@@ -174,6 +213,12 @@ pub enum TypeKind<'vir> {
     Ref, // TODO: typed references ?
     Perm,
     Set(#[serde(with = "crate::serde::serde_ref")] TypeDyn<'vir>),
+    Multiset(#[serde(with = "crate::serde::serde_ref")] TypeDyn<'vir>),
+    Seq(#[serde(with = "crate::serde::serde_ref")] TypeDyn<'vir>),
+    Map(
+        #[serde(with = "crate::serde::serde_ref")] TypeDyn<'vir>,
+        #[serde(with = "crate::serde::serde_ref")] TypeDyn<'vir>,
+    ),
     Unsupported(UnsupportedType<'vir>),
     Err,
 }
@@ -258,20 +303,37 @@ pub struct DomainFunctionData<'vir> {
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
-pub enum CfgBlockLabelData {
+#[serde(bound(deserialize = "'de: 'vir"))]
+pub enum CfgBlockLabelData<'vir> {
     Start,
     End,
     BasicBlock(usize),
     BasicBlockTerminator(usize),
+    PreLoopBasicBlock(
+        usize,
+        #[serde(with = "crate::serde::serde_slice")] &'vir [&'vir usize],
+    ),
+    PreLoopBasicBlockTerminator(
+        usize,
+        #[serde(with = "crate::serde::serde_slice")] &'vir [&'vir usize],
+    ),
 }
 
-impl CfgBlockLabelData {
+impl<'vir> CfgBlockLabelData<'vir> {
     pub fn name(&self) -> String {
         match self {
             Self::Start => "start".to_string(),
             Self::End => "end".to_string(),
             Self::BasicBlock(idx) => format!("bb_{idx}"),
             Self::BasicBlockTerminator(idx) => format!("bb_term_{idx}"),
+            Self::PreLoopBasicBlock(idx, pres) => {
+                let pres = pres.iter().map(|l| format!("_pre{l}")).collect::<String>();
+                format!("bb_{idx}{pres}")
+            }
+            Self::PreLoopBasicBlockTerminator(idx, pres) => {
+                let pres = pres.iter().map(|l| format!("_pre{l}")).collect::<String>();
+                format!("bb_term_{idx}{pres}")
+            }
         }
     }
 }
@@ -280,7 +342,7 @@ impl CfgBlockLabelData {
 pub enum OldLabel<'vir> {
     None,
     Lhs,
-    Block(CfgBlockLabelData),
+    Block(CfgBlockLabelData<'vir>),
     Label(#[serde(with = "crate::serde::serde_str")] &'vir str),
 }
 
@@ -288,6 +350,7 @@ pub type AccFieldData<'vir> = crate::gendata::AccFieldGenData<'vir, (), !>;
 pub type AdtData<'vir> = crate::gendata::AdtGenData<'vir, (), !>;
 pub type AdtConstructorData<'vir> = crate::gendata::AdtConstructorGenData<'vir, (), !>;
 pub type BinOpData<'vir> = crate::gendata::BinOpGenData<'vir, (), !>;
+pub type CollectionBinOpData<'vir> = crate::gendata::CollectionBinOpGenData<'vir, (), !>;
 pub type CfgBlockData<'vir> = crate::gendata::CfgBlockGenData<'vir, (), !>;
 pub type CfgLabelData<'vir> = crate::gendata::CfgLabelGenData<'vir, (), !>;
 pub type DomainAxiomData<'vir> = crate::gendata::DomainAxiomGenData<'vir, (), !>;
@@ -309,7 +372,8 @@ pub type PredicateAppData<'vir> = crate::gendata::PredicateAppGenData<'vir, (), 
 pub type PredicateData<'vir> = crate::gendata::PredicateGenData<'vir, (), !>;
 pub type ProgramData<'vir> = crate::gendata::ProgramGenData<'vir, (), !>;
 pub type PureAssignData<'vir> = crate::gendata::PureAssignGenData<'vir, (), !>;
-pub type SetLiteralData<'vir> = &'vir crate::gendata::SetLiteralGenData<'vir, (), !>;
+pub type CollectionLiteralData<'vir> = &'vir crate::gendata::CollectionLiteralGenData<'vir, (), !>;
+pub type CollectionUpdateData<'vir> = &'vir crate::gendata::CollectionUpdateGenData<'vir, (), !>;
 pub type StmtData<'vir> = crate::gendata::StmtGenData<'vir, (), !>;
 pub type StmtKindData<'vir> = crate::gendata::StmtKindGenData<'vir, (), !>;
 pub type TerminatorStmtData<'vir> = crate::gendata::TerminatorStmtGenData<'vir, (), !>;

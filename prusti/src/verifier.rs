@@ -13,7 +13,7 @@ pub fn verify<'tcx>(
     if env.diagnostic.has_errors() {
         warn!("The compiler reported an error, so the program will not be verified.");
     } else {
-        debug!("Verification task: {:?}", &verification_task);
+        debug!("Verification task: {:?}", verification_task);
         user::message(format!(
             "{}erification of {} items...",
             if verification_task.selective {
@@ -53,8 +53,11 @@ pub fn verify<'tcx>(
             &env.diagnostic,
         );
 
-        let program = request.program;
+        // if we do not use encode-only to get the dumped viper program (e.g., just to see if encoding fails), we don't need to start a JVM
+        if !config::verify_mode().is_encode_only() || config::dump_viper_program() {
+            let program = request.program;
 
-        prusti_server::verify_programs(&env.diagnostic, vec![program]);
+            prusti_server::verify_programs(&env.diagnostic, vec![program]);
+        }
     }
 }

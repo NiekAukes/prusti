@@ -2,10 +2,19 @@ use prusti_interface::{
     environment::EnvBody,
     specs::{specifications::Specifications, typed::DefSpecificationMap},
 };
-use prusti_rustc_interface::middle::ty;
+use prusti_rustc_interface::{data_structures::fx::FxHashMap, middle::ty};
 use std::{cell::RefCell, fmt::Debug};
 
 use crate::{data::*, refs::*};
+
+/// How a Rust item's `DefId` is rendered into a Viper identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentStyle {
+    /// The item's full definition path.
+    DefPath,
+    /// The item's short name. For debugging: name collisions are possible.
+    ItemName,
+}
 
 /// The VIR context is a data structure used throughout the encoding process.
 pub struct VirCtxt<'tcx> {
@@ -28,16 +37,29 @@ pub struct VirCtxt<'tcx> {
     pub body: Option<RefCell<EnvBody<'tcx>>>,
 
     pub specs: Option<RefCell<Specifications<'tcx>>>,
+
+    /// How `ViperIdent::from_def_id` renders a `DefId`.
+    pub ident_style: IdentStyle,
+
+    /// Locals replaced during reification, see [VirCtxt::with_local_subst].
+    local_subst: RefCell<Option<&'tcx FxHashMap<&'tcx str, ExprDyn<'tcx>>>>,
 }
 
 impl<'tcx> VirCtxt<'tcx> {
-    pub fn new(tcx: ty::TyCtxt<'tcx>, body: EnvBody<'tcx>, spec_map: DefSpecificationMap) -> Self {
+    pub fn new(
+        tcx: ty::TyCtxt<'tcx>,
+        body: EnvBody<'tcx>,
+        spec_map: DefSpecificationMap,
+        ident_style: IdentStyle,
+    ) -> Self {
         Self {
             arena: bumpalo::Bump::new(),
             spans: RefCell::new(Default::default()),
             tcx: Some(tcx),
             body: Some(RefCell::new(body)),
             specs: Some(RefCell::new(Specifications::new(spec_map))),
+            ident_style,
+            local_subst: RefCell::new(None),
         }
     }
 
@@ -48,7 +70,43 @@ impl<'tcx> VirCtxt<'tcx> {
             tcx: None,
             body: None,
             specs: None,
+            ident_style: IdentStyle::DefPath,
+            local_subst: RefCell::new(None),
         }
+    }
+
+    /// Runs `f` with the given locals replaced by the given expressions in
+    /// every expression reified meanwhile.
+    pub fn with_local_subst<T>(
+        &'tcx self,
+        subst: &'tcx FxHashMap<&'tcx str, ExprDyn<'tcx>>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let prev = self.local_subst.replace(Some(subst));
+        let res = f();
+        self.local_subst.replace(prev);
+        res
+    }
+
+    pub(crate) fn local_subst<'vir>(&'vir self, name: &str) -> Option<ExprDyn<'vir>> {
+        let e = *self
+            .local_subst
+            .borrow()
+            .and_then(|subst| subst.get(name))?;
+        // SAFETY: the expression is immutable and allocated in the arena,
+        //   which outlives `'vir`
+        Some(unsafe { std::mem::transmute::<ExprDyn<'tcx>, ExprDyn<'vir>>(e) })
+    }
+
+    /// The substitution is by name and does not track binders, so a local
+    /// bound within the reified expression must not be substituted.
+    pub(crate) fn assert_not_substituted(&self, bound: &str) {
+        assert!(
+            self.local_subst
+                .borrow()
+                .is_none_or(|subst| !subst.contains_key(bound)),
+            "`{bound}` is bound in an expression reified with it substituted"
+        );
     }
 
     pub fn tcx(&self) -> ty::TyCtxt<'tcx> {

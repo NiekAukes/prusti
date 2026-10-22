@@ -1,9 +1,10 @@
 use task_encoder::{EncodeFullResult, OutputRefAny, TaskEncoder};
 use vir::{CallableIdn, CastType, FunctionIdn, HasType};
 
-use crate::encoders::ty::{RustParamData, RustTy, TySpecifics, generics::GenericParamsEnc};
-
-use super::r#typeof::{TypeOfEnc, TypeOfEncOutputRef};
+use crate::encoders::ty::{
+    RustParamData, RustTy, TySpecifics,
+    generics::{GenericParamsEnc, sizedness::SizednessEnc},
+};
 
 #[derive(Debug, Clone)]
 pub struct TyConstructorEncOutputRef<'vir> {
@@ -20,30 +21,6 @@ pub struct TyConstructorEncOutputRef<'vir> {
     /// Each function takes as input an instantiated type. The `i`th function in
     /// this list returns the `i`th const argument to the type constructor.
     pub const_param_accessors: &'vir [vir::AdtDestructor<'vir, vir::TyVal, vir::CSnap>],
-
-    pub typeof_data: TypeOfEncOutputRef<'vir>,
-}
-
-impl<'vir> TyConstructorEncOutputRef<'vir> {
-    /// Takes as input a snapshot encoding of a rust value, and returns
-    /// the `idx`th type parameter of its type.
-    pub fn ty_param_from_snap(
-        &self,
-        idx: usize,
-        snap: vir::ExprCSnap<'vir>,
-    ) -> vir::ExprTyVal<'vir> {
-        self.ty_param_accessors[idx].call()((self.typeof_data.typeof_function)(snap.upcast_ty()))
-    }
-
-    /// Takes as input a snapshot encoding of a rust value, and returns
-    /// the `idx`th const parameter of its type.
-    pub fn const_param_from_snap(
-        &self,
-        idx: usize,
-        snap: vir::ExprCSnap<'vir>,
-    ) -> vir::ExprCSnap<'vir> {
-        self.const_param_accessors[idx].call()((self.typeof_data.typeof_function)(snap.upcast_ty()))
-    }
 }
 
 impl<'vir> OutputRefAny for TyConstructorEncOutputRef<'vir> {}
@@ -109,16 +86,15 @@ impl TaskEncoder for TyConstructorEnc {
                 })
                 .collect::<Vec<_>>();
 
-            let typeof_data = deps.require_ref::<TypeOfEnc>(*task_key)?;
             deps.emit_output_ref(
                 *task_key,
                 TyConstructorEncOutputRef {
-                    typeof_data,
                     ty_constructor: type_function_ident,
                     ty_param_accessors: vcx.alloc_slice(&ty_accessor_functions),
                     const_param_accessors: vcx.alloc_slice(&const_accessor_functions),
                 },
             )?;
+            SizednessEnc::require(task_key);
 
             let args = ty_accessor_functions
                 .iter()
@@ -138,8 +114,8 @@ impl TaskEncoder for TyConstructorEnc {
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
         let mut constructors = Self::all_outputs_local_no_errors(program);
         vir::with_vcx(|vcx| {
-            let args = vcx.alloc_array(&[vcx.mk_local_decl("non_unit", vir::TYPE_INT)]);
-            let unknown = vcx.mk_adt_constructor("Unknown_type", args);
+            let args = vcx.alloc_array(&[vcx.mk_local_decl(Self::UNKNOWN_TYPE_ID, vir::TYPE_INT)]);
+            let unknown = vcx.mk_adt_constructor(Self::UNKNOWN_TYPE_NAME, args);
             constructors.push(unknown);
             let adt = vcx.mk_adt(
                 vir::ViperIdent::new("Type"),
@@ -149,4 +125,10 @@ impl TaskEncoder for TyConstructorEnc {
             program.add_adt(adt);
         })
     }
+}
+
+impl TyConstructorEnc {
+    /// The name of the constructor for the unknown type variant in the `Type` ADT.
+    pub const UNKNOWN_TYPE_NAME: &str = "Unknown_type";
+    const UNKNOWN_TYPE_ID: &str = "id";
 }

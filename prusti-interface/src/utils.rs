@@ -9,6 +9,7 @@
 use prusti_rustc_interface::{
     hir,
     middle::{mir, ty::TyCtxt},
+    span::{def_id::DefId, Span, Symbol},
 };
 use std::borrow::Borrow;
 
@@ -85,21 +86,58 @@ impl<'tcx> VecPlace<'tcx> {
     }
 }
 
+/// Returns an iterator over all Prusti attributes (i.e. `prusti::<attr_name>="...")`.
+fn get_prusti_attrs<T: Borrow<hir::Attribute>>(
+    attrs: &[T],
+) -> impl Iterator<Item = &hir::AttrItem> {
+    attrs.iter().filter_map(|attr| match attr.borrow() {
+        hir::Attribute::Unparsed(item)
+            if item.path.segments.len() == 2 && item.path.segments[0].as_str() == "prusti" =>
+        {
+            Some(&**item)
+        }
+        _ => None,
+    })
+}
+
+fn get_prusti_attr<'a, T: Borrow<hir::Attribute>>(
+    attrs: &'a [T],
+    attr_name: &str,
+) -> Option<&'a hir::AttrItem> {
+    get_prusti_attrs(attrs).find(|item| item.path.segments[1].as_str() == attr_name)
+}
+
+/// The `prusti::<attr_name>` marker on `def_id`, for local and external items.
+/// Prusti's attributes are never parsed into an `AttributeKind`, so `find_attr!`
+/// cannot see them; matching the whole path finds exactly what we emit.
+pub fn get_prusti_attr_of<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    attr_name: &str,
+) -> Option<&'tcx hir::AttrItem> {
+    let path = [Symbol::intern("prusti"), Symbol::intern(attr_name)];
+    // Bound so that the iterator borrowing `path` is dropped before it.
+    let mut attrs = tcx.get_attrs_by_path(def_id, &path);
+    attrs.find_map(|attr| match attr {
+        hir::Attribute::Unparsed(item) => Some(&**item),
+        _ => None,
+    })
+}
+
 /// Check if `prusti::<name>` is among the attributes.
 /// Any arguments of the attribute are ignored.
 pub fn has_prusti_attr(attrs: &[hir::Attribute], name: &str) -> bool {
-    attrs.iter().any(|attr| match attr {
-        hir::Attribute::Unparsed(normal_attr) => {
-            let hir::AttrItem {
-                span: _,
-                path: hir::AttrPath { span: _, segments },
-                args: _,
-                ..
-            } = &**normal_attr;
-            segments.len() == 2 && segments[0].as_str() == "prusti" && segments[1].as_str() == name
-        }
-        _ => false,
-    })
+    get_prusti_attr(attrs, name).is_some()
+}
+
+/// The spans of the user's Prusti annotations among `attrs`: every
+/// `prusti::<name>` marker except the per-item version marker. Each marker is
+/// emitted at its own annotation's span, so these point at the individual
+/// attributes rather than the whole item.
+pub fn prusti_annotation_spans(attrs: &[hir::Attribute]) -> impl Iterator<Item = Span> + '_ {
+    get_prusti_attrs(attrs)
+        .filter(|item| item.path.segments[1].as_str() != "specs_version")
+        .map(|item| item.span)
 }
 
 /// Check if `prusti::spec_only` is among the attributes.
@@ -137,35 +175,26 @@ pub fn has_abstract_predicate_attr(attrs: &[hir::Attribute]) -> bool {
 }
 
 /// Read the value stored in a Prusti attribute (e.g. `prusti::<attr_name>="...")`.
-pub fn read_prusti_attrs<T: Borrow<hir::Attribute>>(attr_name: &str, attrs: &[T]) -> Vec<String> {
-    let mut strings = vec![];
-    for attr in attrs {
-        if let hir::Attribute::Unparsed(normal_attr) = &attr.borrow() {
-            if let hir::AttrItem {
-                span: _,
-                path: hir::AttrPath { span: _, segments },
-                args: hir::AttrArgs::Eq { expr, eq_span: _ },
-                ..
-            } = &**normal_attr
-            {
-                // Skip attributes whose path don't match with "prusti::<attr_name>"
-                if !(segments.len() == 2
-                    && segments[0].as_str() == "prusti"
-                    && segments[1].as_str() == attr_name)
-                {
-                    continue;
-                }
-                fn extract_string(token: &prusti_rustc_interface::ast::token::Lit) -> String {
-                    token.symbol.as_str().replace("\\\"", "\"")
-                }
-                strings.push(extract_string(&expr.as_token_lit()));
-            }
-        };
+pub fn read_prusti_attrs<'a, T: Borrow<hir::Attribute>>(
+    attr_name: &'a str,
+    attrs: &'a [T],
+) -> impl Iterator<Item = String> + 'a {
+    get_prusti_attrs(attrs)
+        .filter(move |item| item.path.segments[1].as_str() == attr_name)
+        .filter_map(read_prusti_attr_value)
+}
+
+/// The value of a single Prusti attribute, if it stores one.
+pub fn read_prusti_attr_value(item: &hir::AttrItem) -> Option<String> {
+    match &item.args {
+        hir::AttrArgs::Eq { expr, .. } => {
+            Some(expr.as_token_lit().symbol.as_str().replace("\\\"", "\""))
+        }
+        _ => None,
     }
-    strings
 }
 
 /// Read the value stored in a single Prusti attribute (e.g. `prusti::<attr_name>="...")`.
 pub fn read_prusti_attr<T: Borrow<hir::Attribute>>(attr_name: &str, attrs: &[T]) -> Option<String> {
-    read_prusti_attrs(attr_name, attrs).pop()
+    read_prusti_attrs(attr_name, attrs).next()
 }

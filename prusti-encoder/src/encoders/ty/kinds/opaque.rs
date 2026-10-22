@@ -8,10 +8,9 @@ use task_encoder::{EncodeFullError, TaskEncoderDependencies};
 pub(crate) fn ty_pure<'vir>(
     _data: &RustOpaque<'vir>,
     _deps: &mut TaskEncoderDependencies<'vir, TyPureEnc>,
-    builder: &mut DomainBuilder<'vir>,
+    _builder: &mut DomainBuilder<'vir>,
 ) -> Result<TyPureOpaque<'vir>, EncodeFullError<'vir, TyPureEnc>> {
-    let arbitrary = builder.function("arbitrary", (), builder.self_type());
-    Ok(TyPureOpaqueData { arbitrary })
+    Ok(TyPureOpaqueData {})
 }
 
 pub(crate) fn ty_impure<'vir>(
@@ -25,5 +24,5 @@ pub(crate) fn ty_impure<'vir>(
 
 pub(super) fn set_opaque<'vir>(builder: &mut PredicateBuilder<'vir>) {
     builder.mk_predicate("", None);
-    builder.mk_snap_function(None);
+    builder.mk_snap_function(None, &[]);
 }

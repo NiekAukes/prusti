@@ -1,29 +1,29 @@
 use prusti_rustc_interface::{
     const_eval::{
-        const_eval::{CompileTimeMachine, mk_eval_cx_for_const_val},
+        const_eval::{mk_eval_cx_for_const_val, CompileTimeMachine},
         interpret::{CtfeProvenance, InterpCx, Projectable},
     },
     middle::{
         mir::{
-            self, ConstValue,
+            self,
             interpret::{GlobalAlloc, Scalar},
+            ConstValue,
         },
-        ty,
-        ty::TypingEnv,
+        ty::{self, TypingEnv},
     },
-    span::{Span, def_id::DefId},
+    span::{Span, DUMMY_SP},
 };
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, FunctionIdn};
 
 use crate::encoders::{
-    MirPureEnc, MirPureEncTask, PureKind,
     addr::RefDataEnc,
     ty::{
-        RustTyDecomposition,
         generics::{GParams, GenericParamsEnc},
-        use_pure::{TyUsePureEnc, TyUsePureImmRef, TyUsePureMutRef},
+        use_pure::{TyUsePure, TyUsePureEnc},
+        RustTyDecomposition,
     },
+    MirPureEnc, MirPureEncTask, PureKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,8 +35,8 @@ pub enum ConstEncTask<'vir> {
     },
     Mir {
         const_: mir::Const<'vir>,
-        encoding_depth: usize, // current encoding depth
-        def_id: DefId,         // DefId of the current function
+        encoding_depth: usize,  // current encoding depth
+        context: GParams<'vir>, // generic context of the body the constant is in
         span: Span,
     },
 }
@@ -50,15 +50,26 @@ pub enum ConstEncTask<'vir> {
 /// https://rustc-dev-guide.rust-lang.org/mir/index.html#representing-constants
 pub struct ConstEnc;
 
+thread_local! {
+    /// Counter ensuring every emitted constant gets a unique Viper name.
+    static CONST_CTR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Enc<'enc, 'vir: 'enc> {
     deps: &'enc mut TaskEncoderDependencies<'vir, ConstEnc>,
     ecx: &'enc InterpCx<'vir, CompileTimeMachine<'vir>>,
-    context: GParams<'vir>,
-    span: Span,
+    /// Source location the constant originates from, used only to name the
+    /// emitted functions. Type-level constants lose their span (a monomorphized
+    /// valtree has no source location), so this is `None` for them.
+    span: Option<Span>,
     functions: Vec<vir::Function<'vir>>,
 }
 
 impl<'enc, 'vir: 'enc> Enc<'enc, 'vir> {
+    /// Encodes the `(address, metadata, referent_snapshot)` triple of a
+    /// reference constant. The reference's generic args are `[region, inner]`,
+    /// so the referent type is at index 1; the pointer-metadata type is derived
+    /// from the referent (`()` for sized referents, `usize` for slices/`str`).
     fn encode_ref_addr_snap(
         &mut self,
         val: impl Projectable<'vir, CtfeProvenance>,
@@ -105,56 +116,31 @@ impl<'enc, 'vir: 'enc> Enc<'enc, 'vir> {
         val: impl Projectable<'vir, CtfeProvenance>,
         ty: RustTyDecomposition<'vir>,
     ) -> Result<vir::ExprCSnap<'vir>, EncodeFullError<'vir, ConstEnc>> {
-        let kind = self.deps.require_dep::<TyUsePureEnc>(ty)?;
+        let ty_enc = self.deps.require_dep::<TyUsePureEnc>(ty)?;
         vir::with_vcx(|vcx| {
-            Ok(match &kind.specifics {
+            Ok(match &ty_enc.specifics {
                 super::ty::TySpecifics::ArrayLike(array_data) => {
-                    assert!(!array_data.slice);
-                    let elem_ty = ty.args.args()[1].expect_ty();
-                    let elem_len = ty.args.args()[0]
-                        .expect_const()
-                        .try_to_target_usize(vcx.tcx())
-                        .unwrap();
+                    let ty_array = ty.ty.expect_array();
+                    let elem_ty = ty_array.data.decompose_normalize(ty.args);
+                    let elem_len = val.len(self.ecx).unwrap();
                     let mut posts = Vec::new();
+                    let result = vcx.mk_result(ty_enc.snapshot.downcast_ty());
                     for idx in 0..elem_len {
                         let snap = self.encode_const_val_tree(
                             self.ecx.project_index(&val, idx).unwrap(),
-                            RustTyDecomposition::from_ty(elem_ty, self.context),
+                            elem_ty,
                         )?;
-                        posts.push(
-                            vcx.mk_eq_expr(
-                                snap.upcast_ty(),
-                                array_data.index(
-                                    vcx.mk_result(kind.snapshot.downcast_ty()),
-                                    vcx.mk_const_expr(vir::ConstData::Int(idx as u128))
-                                        .downcast_ty(),
-                                ),
-                            ),
-                        );
+                        let index = vcx
+                            .mk_const_expr(vir::ConstData::Int(idx as u128))
+                            .downcast_ty();
+                        let index_ex = array_data.index(result, index);
+                        posts.push(vcx.mk_eq_expr(snap.upcast_ty(), index_ex));
                     }
-                    // TODO: this might run into collisions
-                    let span_pos = vcx.tcx().sess.source_map().lookup_char_pos(self.span.lo());
-                    let gen_snap_func_idn: FunctionIdn<'_, (), vir::CSnap> = FunctionIdn::new(
-                        vir::vir_format_identifier!(
-                            vcx,
-                            "const_{}_{}",
-                            span_pos.line,
-                            span_pos.col_display
-                        ),
-                        (),
-                        kind.snapshot.downcast_ty(),
-                    );
-                    self.functions.push(vcx.mk_function(
-                        gen_snap_func_idn,
-                        (),
-                        &[],
-                        vcx.alloc_slice(&posts),
-                        None,
-                        None,
-                    ));
-                    (gen_snap_func_idn)()
+                    self.fresh_function(&posts, ty_enc.snapshot.downcast_ty())
                 }
-                super::ty::TySpecifics::Opaque(_) => todo!(),
+                super::ty::TySpecifics::Opaque(_) => {
+                    self.fresh_function(&[], ty_enc.snapshot.downcast_ty())
+                }
                 super::ty::TySpecifics::Primitive(prim) => {
                     let int = self
                         .ecx
@@ -164,15 +150,15 @@ impl<'enc, 'vir: 'enc> Enc<'enc, 'vir> {
                         .expect("scalar should be an integer");
                     let val = int.to_bits(int.size());
                     let val = prim.expr_from_bits(*ty.ty.expect_primitive(), val);
-                    (prim.prim_to_snap)(val)
+                    prim.prim_to_snap(val)
                 }
                 super::ty::TySpecifics::ImmRef(immref) => {
-                    let (addr, snap) = self.encode_ref_addr_snap(val, ty)?;
-                    TyUsePureImmRef::prim_to_snap(immref, addr, snap)
+                    let (addr, metadata, snap) = self.encode_ref_addr_snap(val, ty)?;
+                    immref.prim_to_snap(addr, metadata.upcast_ty(), snap)
                 }
                 super::ty::TySpecifics::MutRef(mutref) => {
-                    let (addr, snap) = self.encode_ref_addr_snap(val, ty)?;
-                    TyUsePureMutRef::prim_to_snap(mutref, addr, snap)
+                    let (addr, metadata, snap) = self.encode_ref_addr_snap(val, ty)?;
+                    mutref.prim_to_snap(addr, metadata.upcast_ty(), snap)
                 }
                 super::ty::TySpecifics::StructLike(struct_data) => {
                     let mut snaps = Vec::new();
@@ -189,6 +175,7 @@ impl<'enc, 'vir: 'enc> Enc<'enc, 'vir> {
                 }
                 super::ty::TySpecifics::EnumLike(enum_data) => {
                     let variant_idx = self.ecx.read_discriminant(&val).unwrap();
+                    let variant = self.ecx.project_downcast(&val, variant_idx).unwrap();
                     let mut snaps = Vec::new();
                     for (idx, field) in ty.ty.expect_enumlike().variants[variant_idx.as_usize()]
                         .inner
@@ -198,7 +185,7 @@ impl<'enc, 'vir: 'enc> Enc<'enc, 'vir> {
                     {
                         snaps.push(
                             self.encode_const_val_tree(
-                                self.ecx.project_field(&val, idx.into()).unwrap(),
+                                self.ecx.project_field(&variant, idx.into()).unwrap(),
                                 field.decompose_normalize(ty.args),
                             )?
                             .upcast_ty(),
@@ -212,6 +199,48 @@ impl<'enc, 'vir: 'enc> Enc<'enc, 'vir> {
             })
         })
     }
+
+    fn fresh_function<T: vir::CompType>(
+        &mut self,
+        posts: &[vir::ExprBool<'vir>],
+        result_ty: vir::Type<'vir, T>,
+    ) -> vir::Expr<'vir, T> {
+        vir::with_vcx(|vcx| {
+            let id = CONST_CTR.with(|c| {
+                let v = c.get();
+                c.set(v + 1);
+                v
+            });
+            // `source_callsite()` walks out of any macro expansion to the user's call site.
+            let idn = match self.span {
+                Some(span) => {
+                    let span_pos = vcx
+                        .tcx()
+                        .sess
+                        .source_map()
+                        .lookup_char_pos(span.source_callsite().lo());
+                    vir::vir_format_identifier!(
+                        vcx,
+                        "const_{}_{}_{}",
+                        span_pos.line,
+                        span_pos.col_display,
+                        id,
+                    )
+                }
+                None => vir::vir_format_identifier!(vcx, "const_{id}"),
+            };
+            let gen_snap_func_idn: FunctionIdn<'_, (), T> = FunctionIdn::new(idn, (), result_ty);
+            self.functions.push(vcx.mk_function(
+                gen_snap_func_idn,
+                (),
+                &[],
+                vcx.alloc_slice(posts),
+                None,
+                None,
+            ));
+            (gen_snap_func_idn)()
+        })
+    }
 }
 
 impl ConstEnc {
@@ -220,63 +249,42 @@ impl ConstEnc {
         const_: ty::Const<'vir>,
         ty: ty::Ty<'vir>,
         context: GParams<'vir>,
-    ) -> Result<vir::ExprCSnap<'vir>, EncodeFullError<'vir, ConstEnc>> {
+    ) -> EncodeFullResult<'vir, Self> {
         match const_.kind() {
             ty::ConstKind::Param(param) => {
-                let params = deps.require_dep::<GenericParamsEnc>(context)?;
-                Ok(params.const_expr(param))
+                let ty_decomp = RustTyDecomposition::from_ty(ty, context);
+                let params = deps.require_dep::<GenericParamsEnc>(ty_decomp.args.context())?;
+                Ok((Vec::new(), params.const_expr(param)))
             }
             ty::ConstKind::Value(val) => {
                 let val = vir::with_vcx(|vcx| vcx.tcx().valtree_to_const_val(val));
-                Self::encode_const_val_ty(deps, val, ty, context)
+                // Type-level constants carry no span, so the emitted functions
+                // are named from the counter alone.
+                Self::encode_const_val(deps, val, ty, context, None)
             }
             k => todo!("const kind {k:?}"),
         }
     }
 
-    fn encode_const_val_ty<'vir>(
-        deps: &mut TaskEncoderDependencies<'vir, Self>,
-        val: ConstValue,
-        ty: ty::Ty<'vir>,
-        context: GParams<'vir>,
+    fn encode_scalar_ty<'vir>(
+        _deps: &mut TaskEncoderDependencies<'vir, Self>,
+        scalar: Scalar,
+        ty: RustTyDecomposition<'vir>,
+        ty_enc: TyUsePure<'vir>,
     ) -> Result<vir::ExprCSnap<'vir>, EncodeFullError<'vir, ConstEnc>> {
-        vir::with_vcx(|vcx| {
-            let ty_task = RustTyDecomposition::from_ty(ty, context);
-            let kind = deps.require_dep::<TyUsePureEnc>(ty_task)?;
-            Ok(match val {
-                ConstValue::Scalar(Scalar::Int(int)) => {
-                    let prim = kind.expect_primitive();
-                    let val = int.to_bits(int.size());
-                    let val = prim.expr_from_bits(ty, val);
-                    (prim.prim_to_snap)(val)
+        Ok(match scalar {
+            Scalar::Int(int) => {
+                let prim = ty_enc.expect_primitive();
+                let val = int.to_bits(int.size());
+                let val = prim.expr_from_bits(*ty.ty.expect_primitive(), val);
+                prim.prim_to_snap(val)
+            }
+            Scalar::Ptr(ptr, _) => {
+                match vir::with_vcx(|vcx| vcx.tcx().global_alloc(ptr.provenance.alloc_id())) {
+                    GlobalAlloc::Memory(_mem) => unreachable!(),
+                    _ => todo!(),
                 }
-                ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
-                    match vcx.tcx().global_alloc(ptr.provenance.alloc_id()) {
-                        GlobalAlloc::Memory(_mem) => unreachable!(),
-                        _ => todo!(),
-                    }
-                }
-                ConstValue::ZeroSized => {
-                    let s = kind.expect_structlike();
-                    s.field_snaps_to_snap(Vec::new())
-                }
-                // Encode `&str` constants to an opaque domain. If we ever want to perform string reasoning
-                // we will need to revisit this encoding, but for the moment this allows assertions to avoid
-                // crashing Prusti.
-                ConstValue::Slice { .. } if ty.peel_refs().is_str() => {
-                    let ref_ty = kind.expect_immref();
-                    let str_ty = ty.peel_refs();
-                    let str_ty_task = RustTyDecomposition::from_ty(str_ty, context);
-                    let str_snap = deps.require_dep::<TyUsePureEnc>(str_ty_task)?;
-                    let str_snap = str_snap.expect_opaque();
-                    // first, we create a string snapshot
-                    let snap = (str_snap.arbitrary)().upcast_ty();
-                    // wrap it in a ref
-                    vir::with_vcx(|vcx| ref_ty.prim_to_snap(vcx.mk_null(), snap))
-                }
-                ConstValue::Slice { .. } => todo!("ConstValue::Slice: {ty:?}"),
-                ConstValue::Indirect { .. } => todo!("ConstValue::Indirect"),
-            })
+            }
         })
     }
 
@@ -285,20 +293,22 @@ impl ConstEnc {
         val: ConstValue,
         ty: ty::Ty<'vir>,
         context: GParams<'vir>,
-        span: Span,
+        span: Option<Span>,
     ) -> EncodeFullResult<'vir, Self> {
-        let ty_ctxt_at = vir::with_vcx(|vcx| vcx.tcx().at(span));
+        // The span only steers const-eval diagnostics; the error itself is
+        // propagated, so a missing span (type-level constant) is fine here.
+        let ty_ctxt_at = vir::with_vcx(|vcx| vcx.tcx().at(span.unwrap_or(DUMMY_SP)));
         let (ecx, valtree) =
             mk_eval_cx_for_const_val(ty_ctxt_at, TypingEnv::fully_monomorphized(), val, ty)
                 .unwrap();
         let mut enc = Enc {
             ecx: &ecx,
             deps,
-            context,
             span,
             functions: Vec::new(),
         };
-        let expr = enc.encode_const_val_tree(valtree, RustTyDecomposition::from_ty(ty, context))?;
+        let ty = RustTyDecomposition::from_ty(ty, context);
+        let expr = enc.encode_const_val_tree(valtree, ty)?;
         Ok((enc.functions, expr))
     }
 }
@@ -334,47 +344,46 @@ impl TaskEncoder for ConstEnc {
                 const_,
                 ty,
                 context,
-            } => (
-                Vec::new(),
-                Self::encode_ty_const(deps, const_, ty, context)?,
-            ),
+            } => Self::encode_ty_const(deps, const_, ty, context)?,
             ConstEncTask::Mir {
                 const_,
                 encoding_depth,
-                def_id,
+                context,
                 span,
             } => match const_ {
                 mir::Const::Val(val, ty) => {
-                    Self::encode_const_val(deps, val, ty, def_id.into(), span)?
+                    Self::encode_const_val(deps, val, ty, context, Some(span))?
                 }
                 mir::Const::Unevaluated(uneval, ty) => vir::with_vcx(|vcx| {
-                    let resolved = {
-                        let typing_env = ty::TypingEnv::post_analysis(vcx.tcx(), def_id);
-                        vcx.tcx()
-                            .const_eval_resolve(typing_env, uneval, vcx.tcx().def_span(def_id))
-                    };
+                    let resolved = vcx
+                        .tcx()
+                        .const_eval_resolve(context.typing_env(), uneval, span);
                     if let Ok(val) = resolved {
-                        Self::encode_const_val(deps, val, ty, def_id.into(), span)
+                        Self::encode_const_val(deps, val, ty, context, Some(span))
                     } else if let Some(promoted) = uneval.promoted {
+                        // The promoted MIR is encoded at identity substs, so
+                        // its types live in the generic context of the body it
+                        // was promoted out of (`uneval.def`): no caller
+                        // context is needed.
                         let task = MirPureEncTask {
                             encoding_depth: encoding_depth + 1,
                             parent_def_id: uneval.def,
-                            param_env: vcx.tcx().param_env(uneval.def),
-                            substs: ty::List::identity_for_item(vcx.tcx(), uneval.def),
+                            gargs: GParams::from(uneval.def).identity_args(),
                             kind: PureKind::Constant(promoted),
-                            caller_def_id: Some(def_id),
                         };
                         let expr = deps.require_dep::<MirPureEnc>(task)?.expect_expr();
                         use vir::Reify;
-                        Ok((Vec::new(), expr.reify(vcx, (uneval.def, &[])).downcast_ty()))
+                        let args = Default::default();
+                        Ok((
+                            Vec::new(),
+                            expr.reify(vcx, (uneval.def, vcx.alloc(args), vir::OldLabel::None))
+                                .downcast_ty(),
+                        ))
                     } else {
                         todo!("const too generic")
                     }
                 })?,
-                mir::Const::Ty(ty, const_) => (
-                    Vec::new(),
-                    Self::encode_ty_const(deps, const_, ty, def_id.into())?,
-                ),
+                mir::Const::Ty(ty, const_) => Self::encode_ty_const(deps, const_, ty, context)?,
             },
         })
     }

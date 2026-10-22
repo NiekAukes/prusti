@@ -1,8 +1,9 @@
 use crate::{
     environment::Environment,
     utils::{
-        has_abstract_predicate_attr, has_extern_spec_attr, has_prusti_attr, has_to_model_fn_attr,
-        read_prusti_attr, read_prusti_attrs,
+        get_prusti_attr_of, has_abstract_predicate_attr, has_extern_spec_attr, has_prusti_attr,
+        has_to_model_fn_attr, prusti_annotation_spans, read_prusti_attr, read_prusti_attr_value,
+        read_prusti_attrs,
     },
     PrustiError,
 };
@@ -57,6 +58,16 @@ impl From<&ProcedureSpecRefs> for ProcedureSpecificationKind {
     }
 }
 
+/// Specs of a `closure!` closure, extracted from the `closure_spec_pre` /
+/// `closure_spec_post` marker calls the macro splices into its body.
+#[derive(Debug, Default)]
+struct ClosureSpecRefs {
+    pres: Vec<LocalDefId>,
+    posts: Vec<LocalDefId>,
+    pure: bool,
+    trusted: bool,
+}
+
 #[derive(Debug, Default)]
 struct TypeSpecRefs {
     invariants: Vec<LocalDefId>,
@@ -79,14 +90,13 @@ pub struct SpecCollector<'a, 'tcx> {
 
     /// Map from functions/loops/types to their specifications.
     procedure_specs: FxHashMap<LocalDefId, ProcedureSpecRefs>,
+    closure_specs: FxHashMap<LocalDefId, ClosureSpecRefs>,
     loop_specs: Vec<LocalDefId>,
     loop_variants: Vec<LocalDefId>,
     type_specs: FxHashMap<LocalDefId, TypeSpecRefs>,
     prusti_assertions: Vec<LocalDefId>,
     prusti_assumptions: Vec<LocalDefId>,
     prusti_refutations: Vec<LocalDefId>,
-    ghost_begin: Vec<LocalDefId>,
-    ghost_end: Vec<LocalDefId>,
 }
 
 impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
@@ -96,14 +106,13 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
             env,
             spec_functions: FxHashMap::default(),
             procedure_specs: FxHashMap::default(),
+            closure_specs: FxHashMap::default(),
             loop_specs: vec![],
             loop_variants: vec![],
             type_specs: FxHashMap::default(),
             prusti_assertions: vec![],
             prusti_assumptions: vec![],
             prusti_refutations: vec![],
-            ghost_begin: vec![],
-            ghost_end: vec![],
         }
     }
 
@@ -118,17 +127,65 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
     pub fn build_def_specs(&mut self) -> typed::DefSpecificationMap {
         let mut def_spec = typed::DefSpecificationMap::new();
         self.determine_procedure_specs(&mut def_spec);
+        self.determine_closure_specs(&mut def_spec);
         self.determine_extern_specs(&mut def_spec);
         self.determine_loop_specs(&mut def_spec);
         self.determine_type_specs(&mut def_spec);
         self.determine_prusti_assertions(&mut def_spec);
         self.determine_prusti_assumptions(&mut def_spec);
         self.determine_prusti_refutations(&mut def_spec);
-        self.determine_ghost_begin_ends(&mut def_spec);
         // TODO: remove spec functions (make sure none are duplicated or left over)
         // Load all local spec MIR bodies, for export and later use
         self.ensure_local_mirs_fetched(&def_spec);
         def_spec
+    }
+
+    /// A trait implementation may only carry Prusti annotations if its `impl`
+    /// block is marked `#[refine_trait_spec]`. Without it, an annotated method
+    /// silently fails to refine the inherited trait spec (and would conflict
+    /// with a `#[pure]` trait method), so we reject it instead. Inherent impls
+    /// and trait items are unaffected. The error points at the offending
+    /// annotation (the `prusti::specs_version` marker the attribute macros emit
+    /// at the invocation site) with a note pointing at the `impl` block, where
+    /// the missing `#[refine_trait_spec]` must be added.
+    fn check_trait_impl_refinement(&self, method_def_id: DefId) {
+        let tcx = self.env.tcx();
+        let Some(impl_def_id) = tcx.impl_of_assoc(method_def_id) else {
+            return;
+        };
+        if tcx.impl_opt_trait_ref(impl_def_id).is_none() {
+            return;
+        }
+        let Some(impl_local) = impl_def_id.as_local() else {
+            return;
+        };
+        let impl_attrs = self.env.query.get_local_attributes(impl_local);
+        if has_prusti_attr(impl_attrs, "refine_trait_spec") {
+            return;
+        }
+        let method_attrs = self
+            .env
+            .query
+            .get_local_attributes(method_def_id.expect_local());
+        // Point at the offending annotation(s). Each carries its own span, so
+        // this is precise even when several are stacked. No annotation marker
+        // means no explicit annotation - e.g. the implicit trusted from opt-in
+        // verification - which must not error.
+        let annotation_spans = prusti_annotation_spans(method_attrs).collect::<Vec<_>>();
+        if annotation_spans.is_empty() {
+            return;
+        }
+        PrustiError::incorrect(
+            "Prusti annotations on a trait implementation require the \
+             `#[refine_trait_spec]` attribute on the `impl` block"
+                .to_string(),
+            MultiSpan::from_spans(annotation_spans),
+        )
+        .add_note(
+            "add `#[refine_trait_spec]` to this `impl` block",
+            Some(tcx.def_span(impl_def_id)),
+        )
+        .emit(&self.env.diagnostic);
     }
 
     fn determine_procedure_specs(&self, def_spec: &mut typed::DefSpecificationMap) {
@@ -175,7 +232,11 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
                 }
             }
 
-            spec.set_trusted(refs.trusted);
+            // An `#[extern_spec]` is assumed whether or not it says
+            // `#[trusted]`; the missing annotation is reported by
+            // `determine_extern_specs`, which knows the specified function.
+            let attrs = self.env.query.get_local_attributes(*local_id);
+            spec.set_trusted(refs.trusted || has_extern_spec_attr(attrs));
 
             if let Some(kind) = kind_override {
                 spec.set_kind(kind);
@@ -195,23 +256,106 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         }
     }
 
+    fn determine_closure_specs(&self, def_spec: &mut typed::DefSpecificationMap) {
+        for (local_id, refs) in self.closure_specs.iter() {
+            // TODO: add support for referring to captured variables in closure
+            // specs. For now, we just reject it.
+            for spec in refs.pres.iter().chain(&refs.posts) {
+                if !self.env.tcx().closure_captures(*spec).is_empty() {
+                    PrustiError::incorrect(
+                        "closure specifications may only refer to the closure's \
+                         parameters and `result`, not to captured variables",
+                        MultiSpan::from_span(self.env.query.get_def_span(*spec)),
+                    )
+                    .emit(&self.env.diagnostic);
+                }
+            }
+            let mut spec = SpecGraph::new(ProcedureSpecification::empty(local_id.to_def_id()));
+            spec.set_kind(if refs.pure {
+                ProcedureSpecificationKind::Pure
+            } else {
+                ProcedureSpecificationKind::Impure
+            });
+            for pre in &refs.pres {
+                spec.add_precondition(*pre, self.env);
+            }
+            for post in &refs.posts {
+                spec.add_postcondition(*post, self.env);
+            }
+            spec.set_trusted(refs.trusted);
+            def_spec.proc_specs.insert(local_id.to_def_id(), spec);
+        }
+    }
+
     fn determine_extern_specs(&self, def_spec: &mut typed::DefSpecificationMap) {
         self.extern_resolver.check_errors(&self.env.diagnostic);
         for (extern_spec_decl, spec_id) in self.extern_resolver.extern_fn_map.iter() {
             let target_def_id = extern_spec_decl.get_target_def_id();
 
+            // `#[extern_spec]` is for items defined in other crates. A local
+            // target should be specified directly on its definition instead.
+            // Declarations in an `extern` block are the exception: they are
+            // local but have no body to attach a specification to, so an
+            // `#[extern_spec]` is the only way to specify them.
+            let target = self.env.name.get_item_name(target_def_id);
+            let span = MultiSpan::from_span(self.env.query.get_def_span(spec_id));
+            if target_def_id.is_local() && !self.env.tcx().is_foreign_item(target_def_id) {
+                PrustiError::incorrect(
+                    format!("`#[extern_spec]` cannot be used for `{target}`, which is defined in this crate"),
+                    span,
+                )
+                .set_help(format!("specify `{target}` directly on its definition instead"))
+                .emit(&self.env.diagnostic);
+                continue;
+            }
+
             if def_spec.proc_specs.contains_key(&target_def_id) {
                 PrustiError::incorrect(
                     format!(
-                        "external specification provided for {}, which already has a specification",
-                        self.env.name.get_item_name(target_def_id)
+                        "external specification provided for {target}, which already has a specification"
                     ),
-                    MultiSpan::from_span(self.env.query.get_def_span(spec_id)),
+                    span.clone(),
                 )
                 .emit(&self.env.diagnostic);
             }
 
-            let mut spec = def_spec.proc_specs.remove(spec_id).unwrap();
+            // Prusti never verifies the specified function against this
+            // specification, so require an explicit `#[trusted]`. A stub with
+            // no annotation at all does not reach `determine_procedure_specs`,
+            // hence both cases are checked here; a stub that has annotations
+            // but no `#[trusted]` still gets one there, so that a single
+            // omission does not cascade.
+            let stub_refs = self.procedure_specs.get(&spec_id.expect_local());
+            if !stub_refs.is_some_and(|refs| refs.trusted) {
+                let mut error = PrustiError::incorrect(
+                    format!(
+                        "function `{target}` in an `#[extern_spec]` must be marked `#[trusted]`"
+                    ),
+                    span.clone(),
+                )
+                .add_note(
+                    "an `#[extern_spec]` is never verified against the body of the function it \
+                     specifies, so the specification is assumed; `#[trusted]` states that \
+                     explicitly",
+                    None,
+                );
+                if stub_refs.is_none() {
+                    // Nothing is specified, so removing it loses nothing.
+                    error = error.set_help(
+                        "if this function is not meant to be specified, remove it from the \
+                         `#[extern_spec]` instead",
+                    );
+                }
+                error.emit(&self.env.diagnostic);
+            }
+
+            // The stub may have been rejected during procedure-spec collection
+            // (e.g. a type-conditional refinement that could not be applied),
+            // or carry no specification at all; either way there is nothing to
+            // transfer, and any error is already reported.
+            let Some(mut spec) = def_spec.proc_specs.remove(spec_id) else {
+                continue;
+            };
             spec.set_extern_spec(extern_spec_decl.into());
             def_spec.proc_specs.insert(target_def_id, spec);
         }
@@ -291,20 +435,6 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
             );
         }
     }
-    fn determine_ghost_begin_ends(&self, def_spec: &mut typed::DefSpecificationMap) {
-        for local_id in self.ghost_begin.iter() {
-            def_spec.ghost_begin.insert(
-                local_id.to_def_id(),
-                typed::GhostBegin { marker: *local_id },
-            );
-        }
-        for local_id in self.ghost_end.iter() {
-            def_spec
-                .ghost_end
-                .insert(local_id.to_def_id(), typed::GhostEnd { marker: *local_id });
-        }
-    }
-
     fn ensure_local_mirs_fetched(&mut self, def_spec: &typed::DefSpecificationMap) {
         let (specs, pure_fns, predicates) = def_spec.defid_for_export();
         for def_id in &specs {
@@ -370,8 +500,31 @@ fn parse_spec_id(spec_id: String, def_id: DefId) -> SpecificationId {
 /// Returns true iff def_id points to a spec function (i.e. a function for
 /// which we don't need polonius/borrowck facts)
 pub fn is_spec_fn(tcx: ty::TyCtxt, def_id: DefId) -> bool {
-    let attrs = tcx.get_all_attrs(def_id);
-    read_prusti_attr("spec_id", attrs).is_some()
+    get_prusti_attr_of(tcx, def_id, "spec_id")
+        .and_then(read_prusti_attr_value)
+        .is_some()
+}
+
+/// Returns true iff def_id points to a specification-only item: a spec
+/// function or closure (marked `spec_only` or carrying a `spec_id`, e.g.
+/// the spec closures of `closure!` and the checker closure of `ghost!`),
+/// or a closure nested inside one (e.g. a closure used within a
+/// specification expression).
+pub fn is_spec_item(tcx: ty::TyCtxt, def_id: DefId) -> bool {
+    let mut def_id = def_id;
+    loop {
+        if get_prusti_attr_of(tcx, def_id, "spec_only").is_some()
+            || get_prusti_attr_of(tcx, def_id, "spec_id")
+                .and_then(read_prusti_attr_value)
+                .is_some()
+        {
+            return true;
+        }
+        if !tcx.is_closure_like(def_id) {
+            return false;
+        }
+        def_id = tcx.parent(def_id);
+    }
 }
 
 #[tracing::instrument(level = "trace")]
@@ -380,33 +533,27 @@ fn get_procedure_spec_ids(def_id: DefId, attrs: &[hir::Attribute]) -> Option<Pro
 
     spec_id_refs.extend(
         read_prusti_attrs("pre_spec_id_ref", attrs)
-            .into_iter()
             .map(|raw_spec_id| SpecIdRef::Precondition(parse_spec_id(raw_spec_id, def_id))),
     );
     spec_id_refs.extend(
         read_prusti_attrs("post_spec_id_ref", attrs)
-            .into_iter()
             .map(|raw_spec_id| SpecIdRef::Postcondition(parse_spec_id(raw_spec_id, def_id))),
     );
     spec_id_refs.extend(
         read_prusti_attrs("pure_spec_id_ref", attrs)
-            .into_iter()
             .map(|raw_spec_id| SpecIdRef::Purity(parse_spec_id(raw_spec_id, def_id))),
     );
     spec_id_refs.extend(
         read_prusti_attrs("terminates_spec_id_ref", attrs)
-            .into_iter()
             .map(|raw_spec_id| SpecIdRef::Terminates(parse_spec_id(raw_spec_id, def_id))),
     );
     spec_id_refs.extend(
         // TODO: pledges with LHS that is not "result" would need to carry the
         // LHS expression through typing
-        read_prusti_attrs("pledge_spec_id_ref", attrs)
-            .into_iter()
-            .map(|raw_spec_id| SpecIdRef::Pledge {
-                lhs: None,
-                rhs: parse_spec_id(raw_spec_id, def_id),
-            }),
+        read_prusti_attrs("pledge_spec_id_ref", attrs).map(|raw_spec_id| SpecIdRef::Pledge {
+            lhs: None,
+            rhs: parse_spec_id(raw_spec_id, def_id),
+        }),
     );
     match (
         read_prusti_attr("assert_pledge_spec_id_ref_lhs", attrs),
@@ -545,14 +692,6 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for SpecCollector<'a, 'tcx> {
             if has_prusti_attr(attrs, "prusti_refutation") {
                 self.prusti_refutations.push(local_id);
             }
-
-            if has_prusti_attr(attrs, "ghost_begin") {
-                self.ghost_begin.push(local_id);
-            }
-
-            if has_prusti_attr(attrs, "ghost_end") {
-                self.ghost_end.push(local_id);
-            }
         } else {
             // Don't collect specs "for" spec items
 
@@ -566,6 +705,7 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for SpecCollector<'a, 'tcx> {
 
             // Collect procedure specifications
             if let Some(procedure_spec_ref) = get_procedure_spec_ids(def_id, attrs) {
+                self.check_trait_impl_refinement(def_id);
                 self.procedure_specs.insert(local_id, procedure_spec_ref);
             }
 
@@ -601,14 +741,84 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for SpecCollector<'a, 'tcx> {
             let attrs = self.env.query.get_local_attributes(local.hir_id);
             if has_prusti_attr(attrs, "closure") {
                 let init_expr = local.init.expect("closure on Local without assignment");
-                let local_id = self.env.query.as_local_def_id(init_expr.hir_id);
-                let def_id = local_id.to_def_id();
-                // Collect procedure specifications
-                if let Some(procedure_spec_ref) = get_procedure_spec_ids(def_id, attrs) {
-                    self.procedure_specs.insert(local_id, procedure_spec_ref);
+                let hir::ExprKind::Closure(closure) = init_expr.kind else {
+                    unreachable!(
+                        "`prusti::closure` on a binding whose initializer is not a closure"
+                    );
+                };
+                let local_id = closure.def_id;
+                let mut refs = ClosureSpecRefs {
+                    pure: has_prusti_attr(attrs, "pure"),
+                    trusted: has_prusti_attr(attrs, "trusted"),
+                    ..ClosureSpecRefs::default()
+                };
+                let mut extractor = ClosureSpecExtractor {
+                    tcx: self.env.tcx(),
+                    refs: &mut refs,
+                    depth: 0,
+                };
+                intravisit::Visitor::visit_expr(&mut extractor, init_expr);
+                self.closure_specs.insert(local_id, refs);
+            }
+        }
+    }
+}
+
+/// Extracts the spec closures (the last argument) from the
+/// `closure_spec_pre(args, f)` / `closure_spec_post(args_result, phantom, f)`
+/// marker calls in a `closure!` closure's body. Does not descend into nested
+/// closures other than the `closure!` closure itself, so nested `closure!`
+/// uses (collected on their own) and user closures are not misattributed.
+struct ClosureSpecExtractor<'a, 'tcx> {
+    tcx: ty::TyCtxt<'tcx>,
+    refs: &'a mut ClosureSpecRefs,
+    depth: usize,
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for ClosureSpecExtractor<'_, 'tcx> {
+    type NestedFilter = prusti_rustc_interface::middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::Closure(_) = expr.kind {
+            if self.depth > 0 {
+                return;
+            }
+            self.depth += 1;
+            intravisit::walk_expr(self, expr);
+            self.depth -= 1;
+            return;
+        }
+        if let hir::ExprKind::Call(callee, args) = expr.kind {
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind {
+                if let hir::def::Res::Def(hir::def::DefKind::Fn, callee_id) = path.res {
+                    if self.tcx.crate_name(callee_id.krate).as_str() == "prusti_contracts" {
+                        let is_spec = match self.tcx.item_name(callee_id).as_str() {
+                            "closure_spec_pre" => Some(&mut self.refs.pres),
+                            "closure_spec_post" => Some(&mut self.refs.posts),
+                            _ => None,
+                        };
+                        if let Some(specs) = is_spec {
+                            // The spec closure is the last argument.
+                            let last = args
+                                .last()
+                                .expect("malformed closure spec marker: no arguments");
+                            let hir::ExprKind::Closure(spec_closure) = last.kind else {
+                                unreachable!(
+                                    "malformed closure spec marker: last argument is not a \
+                                     closure literal"
+                                );
+                            };
+                            specs.push(spec_closure.def_id);
+                        }
+                    }
                 }
             }
         }
+        intravisit::walk_expr(self, expr);
     }
 }
 
