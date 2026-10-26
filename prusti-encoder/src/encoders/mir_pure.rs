@@ -1,8 +1,6 @@
 use crate::encoders::{
-    ConstEnc, FunctionCallEnc, Mode, PrustiBuiltin, SpecBuiltin, ViperTupleEnc,
-    builtin::seq_repeat_function,
-    r#const::ConstEncTask,
-    mir_fn::{CallTaskDescription, GhostBlocks, RustSignature},
+    FunctionCallEnc, Mode, PrustiBuiltin, SpecBuiltin, ViperTupleEnc,
+    mir_fn::{CallTaskDescription, RustSignature, SpecArms},
     mir_shared::{EncodeResult, PureRvalueEnc, RustcIntrinsic},
     pure::spec::MirSpecEncMode,
     ty::{
@@ -282,9 +280,9 @@ struct Enc<'vir: 'enc, 'enc> {
     context: GParams<'vir>,
     body: &'enc mir::Body<'vir>,
     rev_doms: rev_doms::ReverseDominators,
-    /// The `ghost!` blocks of the body (the same detection the impure
-    /// encoder uses, via `SpecBlocks`).
-    ghost: GhostBlocks,
+    /// The `ghost!` and `closure!` arms of the body (the same detection the
+    /// impure encoder uses, via `SpecBlocks`).
+    spec_arms: SpecArms,
     deps: &'enc mut TaskEncoderDependencies<'vir, MirPureEnc>,
     /// Always holds the next version to be used for a local.
     version_ctr: IndexVec<mir::Local, usize>,
@@ -385,7 +383,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             context: gargs.context(),
             body,
             rev_doms,
-            ghost: GhostBlocks::new(def_id, body),
+            spec_arms: SpecArms::for_body(def_id, body),
             deps,
             // visited: IndexVec::from_elem_n(false, body.basic_blocks.len()),
             version_ctr: IndexVec::from_elem_n(0, body.local_decls.len()),
@@ -667,12 +665,12 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             }
 
             mir::TerminatorKind::SwitchInt { discr, targets } => {
-                // A `ghost!` block's `if false` switch: continue straight
-                // into the ghost arm (the inline ghost body); the runtime
-                // `ghost_erased` stand-in arm is skipped.
-                if let Some(ghost) = self.ghost.switches.get(&curr) {
-                    let rest_update =
-                        self.encode_cfg(&new_curr_ver, ghost.arm_block, join_point)?;
+                // The `if false` switch of a `ghost!` block or a `closure!`
+                // spec marker: continue straight into the live target (the
+                // inline ghost body, or the continuation); the other arm is
+                // skipped.
+                if let Some(live) = self.spec_arms.switches.get(&curr) {
+                    let rest_update = self.encode_cfg(&new_curr_ver, *live, join_point)?;
                     return Ok(stmt_update.merge(rest_update));
                 }
 
@@ -1055,32 +1053,10 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 fields,
             ) => self.encode_aggregate_snap(rvalue_ty, kind, fields, curr_ver),
             mir::Rvalue::Aggregate(box mir::AggregateKind::Array(..), elements) => {
-                let elements = elements
-                    .iter()
-                    .map(|element| self.encode_operand_snap(element, curr_ver))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let e_ty = self.ty_use(rvalue_ty);
-                Ok(e_ty.expect_array().elems_to_snap(&elements).upcast_ty())
+                self.encode_array_snap(rvalue_ty, elements, curr_ver)
             }
             mir::Rvalue::Repeat(operand, len) => {
-                let usize_ty = self.vcx.tcx().types.usize;
-                let len = self.deps.require_dep::<ConstEnc>(ConstEncTask::Ty {
-                    const_: *len,
-                    ty: usize_ty,
-                    context: self.context(),
-                })?;
-                let len = self
-                    .ty_use(usize_ty)
-                    .expect_primitive()
-                    .snap_to_prim(len.lift())
-                    .downcast_ty();
-                let seq_repeat = seq_repeat_function(self.deps)?;
-                let element = self.encode_operand_snap(operand, curr_ver)?;
-                let e_ty = self.ty_use(rvalue_ty);
-                Ok(e_ty
-                    .expect_array()
-                    .repeat_to_snap(element, len, seq_repeat)
-                    .upcast_ty())
+                self.encode_repeat_snap(rvalue_ty, operand, *len, curr_ver)
             }
             mir::Rvalue::Discriminant(place) => {
                 let place_ty = place.ty(self.body, self.vcx.tcx());
