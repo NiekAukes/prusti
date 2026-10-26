@@ -33,10 +33,16 @@ pub(crate) fn dep_error<'vir, E: TaskEncoder + ?Sized>(
     err: &EncodeFullError<'vir, E>,
 ) -> (String, Option<Span>) {
     match err {
-        EncodeFullError::DependencyError(chain) => chain
-            .last()
-            .map(|(_, msg, spans)| (msg.clone(), spans.first().copied()))
-            .unwrap_or_else(|| ("encoding dependency error".to_string(), None)),
+        EncodeFullError::DependencyError(chain) => (
+            chain.last().map_or_else(
+                || "encoding dependency error".to_string(),
+                |(_, msg, _)| msg.clone(),
+            ),
+            chain
+                .iter()
+                .rev()
+                .find_map(|(_, _, spans)| spans.first().copied()),
+        ),
         other => (format!("{other:?}"), None),
     }
 }

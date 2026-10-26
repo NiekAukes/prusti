@@ -2454,15 +2454,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                         // it is inhabited.
                         self.stmt(vcx.mk_inhale_stmt(return_ty_use.inhabited()));
                     } else {
-                        let Ok(func_out) = self.deps.require_dep::<encoders::MethodCallEnc>(
+                        let func_out = self.deps.require_dep_spanned::<encoders::MethodCallEnc>(
                             CallTaskDescription::new(self.def_id, caller_substs, func_def_id),
-                        ) else {
-                            self.current_terminator = Some(
-                                self.vcx
-                                    .mk_dummy_stmt(vir::vir_format!(self.vcx, "recursion",)),
-                            );
-                            return Ok(());
-                        };
+                            span,
+                        )?;
 
                         let method_in = args
                             .iter()
