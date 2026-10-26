@@ -472,7 +472,9 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             ty::TyKind::Array(..) => String::from("Array"),
             ty::TyKind::Slice(..) => String::from("Slice"),
             ty::TyKind::Dynamic(..) => String::from("Dyn"),
-            ty::TyKind::Foreign(def_id) | ty::TyKind::FnDef(def_id, _) => def_id_name(*def_id),
+            // A tuple struct's constructor has the same def path as the struct.
+            ty::TyKind::FnDef(def_id, _) => format!("FnDef_{}", def_id_name(*def_id)),
+            ty::TyKind::Foreign(def_id) => def_id_name(*def_id),
             ty::TyKind::Pat(ty, _) => Self::ty_name(*ty),
             other => unimplemented!("ty_name for {:?}", other),
         }

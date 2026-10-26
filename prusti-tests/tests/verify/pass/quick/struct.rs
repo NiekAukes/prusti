@@ -18,5 +18,13 @@ fn rtype_same(foo1: &Foo, foo2: &Foo) -> bool {
     foo1.r#type == foo2.r#type
 }
 
+struct Pair(i32, i32);
+
+// The constructor's fn item type is distinct from the struct type.
+fn constructor_as_value() -> Pair {
+    let make = Pair;
+    make(1, 2)
+}
+
 fn main(){
 }
