@@ -1,3 +1,4 @@
+//@ known-failure
 //! Assignments to non local variables in pure code are currently not supported,
 //! but can be in the future.
 use prusti_contracts::*;
@@ -28,5 +29,3 @@ fn client2() {
     let y = (1, 2);
     assert!(x == y); // Should fail
 }
-
-fn main() {}

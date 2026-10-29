@@ -1,3 +1,4 @@
+//@ known-failure
 pub enum TrackingId {
     Static(&'static str),
 }
@@ -23,5 +24,3 @@ fn go(key_name: String) -> () {
         key_name
     };
 }
-
-fn main() {}

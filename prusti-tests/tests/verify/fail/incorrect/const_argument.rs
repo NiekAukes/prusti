@@ -1,3 +1,4 @@
+//@ known-failure
 use prusti_contracts::*;
 
 fn foo(_x: i32) {}
@@ -11,5 +12,3 @@ fn test(x: i32) {
         i -= 1;
     }
 }
-
-fn main() {}

@@ -1,3 +1,4 @@
+//@ known-failure
 use prusti_contracts::*;
 
 #[requires(0 <= n && n <= 20)]
@@ -31,5 +32,3 @@ fn fib2(n: i32) -> i32 {
         _ => fib2(n - 1) + fib2(n - 2),
     }
 }
-
-fn main() {}

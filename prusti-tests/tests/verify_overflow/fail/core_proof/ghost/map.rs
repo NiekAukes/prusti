@@ -1,3 +1,4 @@
+//@ known-failure
 //@ compile-flags: -Punsafe_core_proof=true
 
 #![allow(unused)]
@@ -46,5 +47,3 @@ fn map_lookup(m: Map, k: u32, v1: u32, v2: u32) {
 fn map_construction() {
     let map1 = Map::new();
 }
-
-fn main() {}

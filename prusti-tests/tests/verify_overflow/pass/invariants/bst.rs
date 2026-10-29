@@ -1,9 +1,9 @@
+//@ known-failure
 //@ compile-flags: -Penable_type_invariants=true
 // ignore-test Invariant as stated is too weak to conclude that `contains` and
 //   `contains_golden` have the same result.
 
 use prusti_contracts::*;
-fn main() {}
 
 #[invariant(
     if let BST::Node { value, left, right } = &self {

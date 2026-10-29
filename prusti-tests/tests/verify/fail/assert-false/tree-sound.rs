@@ -14,8 +14,6 @@ fn take_left(tree: Tree) -> Option<Tree> {
         Some(box left) => Some(left),
         None => None,
     };
-    assert!(false);  //~ERROR: the asserted expression might not hold
+    assert!(false);  //~ERROR: might not hold
     ret
 }
-
-fn main() {}

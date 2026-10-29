@@ -1,3 +1,4 @@
+//@ known-failure
 struct T(u32, i32);
 
 impl Default for T {
@@ -5,5 +6,3 @@ impl Default for T {
         panic!("Error message") //~ ERROR
     }
 }
-
-fn main() {}

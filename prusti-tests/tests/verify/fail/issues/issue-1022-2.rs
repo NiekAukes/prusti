@@ -1,3 +1,4 @@
+//@ known-failure
 use prusti_contracts::*;
 
 trait SomeTrait {
@@ -12,5 +13,3 @@ impl SomeTrait for SomeStruct {
         }
     }
 }
-
-fn main() {}

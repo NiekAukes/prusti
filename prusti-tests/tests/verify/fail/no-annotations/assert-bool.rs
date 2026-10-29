@@ -1,5 +1,3 @@
 fn foo(x: bool) {
-    assert!(x);  //~ERROR: the asserted expression might not hold
+    assert!(x);  //~ERROR: might not hold
 }
-
-fn main() {}

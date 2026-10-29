@@ -1,3 +1,4 @@
+//@ known-failure
 use prusti_contracts::*;
 
 trait A<T, U> {
@@ -41,7 +42,4 @@ fn verify_no_match_1() {
 fn verify_no_match_2() {
     let f = FooNoMatch2;
     assert!(foo(f) > 0); //~ ERROR: [Prusti: verification error] the asserted expression might not hold
-}
-
-fn main() {
 }

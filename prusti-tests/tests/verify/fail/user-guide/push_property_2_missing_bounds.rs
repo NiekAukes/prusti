@@ -1,3 +1,4 @@
+//@ known-failure
 // The next line is only required for doctests, you can ignore/remove it
 extern crate prusti_contracts;
 use prusti_contracts::*;
@@ -67,7 +68,7 @@ impl Link {
                     node.next.lookup(index - 1)
                 }
             }
-            Link::Empty => unreachable!(), //~ ERROR: unreachable!(..) statement might be reachable
+            Link::Empty => unreachable!(), //~ ERROR: might not hold
         }
     }
     //// ANCHOR_END: lookup

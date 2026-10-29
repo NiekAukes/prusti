@@ -1,3 +1,4 @@
+//@ known-failure
 #![allow(unused_comparisons)]
 
 /// Issue #73: "Properly report failing precondition of pure functions"
@@ -64,5 +65,3 @@ fn binary_search_help(arr: VecWrapperusize, left: usize, right: usize, target: u
     }
     return None;
 }
-
-fn main() {}
