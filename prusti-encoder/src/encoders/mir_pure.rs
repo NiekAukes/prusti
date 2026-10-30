@@ -27,6 +27,9 @@ use vir::{CastType, CompType, add_debug_note};
 
 pub struct MirPureEnc;
 
+/// The local holding a closure (or a reference to it) in the closure's body.
+const CLOSURE_SELF: mir::Local = mir::Local::from_u32(1);
+
 #[derive(Clone, Debug)]
 pub enum MirPureEncError {
     // UnsupportedStatement,
@@ -52,6 +55,33 @@ type SpecClosure<'vir> = (
 pub struct MirPureEncOutput<'vir> {
     pub inputs: Vec<mir::Local>,
     pub expr: ExprRet<'vir>,
+    /// For a spec closure body: the modes in which the body reads its
+    /// captures. The caller must supply the closure's environment as seen in
+    /// each of them (see `StateMode::env_local`).
+    pub modes_used: Vec<StateMode>,
+}
+
+/// A mode of a specification that reads a state other than the current one
+/// (`old`, `before_expiry`, `rel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StateMode {
+    Old,
+    BeforeExpiry,
+    Rel0,
+    Rel1,
+}
+
+impl StateMode {
+    /// The key under which a spec closure body is given the closure's
+    /// environment as seen in this mode. A spec closure is encoded as a
+    /// separate body that receives its captures as a value (`_1`), built by
+    /// the parent in the parent's current state; inside the closure, `old`
+    /// and the other modes have no heap read left to act on. The parent
+    /// therefore also builds the environment in each mode the body uses, and
+    /// passes it under this synthetic local, which no MIR body has.
+    pub fn env_local(self) -> mir::Local {
+        mir::Local::from_u32(mir::Local::MAX_AS_U32 - self as u32)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,7 +151,7 @@ impl TaskEncoder for MirPureEnc {
         let (_, kind, def_id, gargs) = *task_key;
 
         tracing::debug!("encoding {def_id:?}");
-        let (inputs, expr) = vir::with_vcx(move |vcx| {
+        let (inputs, expr, modes_used) = vir::with_vcx(move |vcx| {
             // The bodies are encoded generically, so they are fetched at the
             // compiler's identity arguments. The one exception is a trait's
             // specification encoded for an `impl` of that trait, which is
@@ -169,6 +199,10 @@ impl TaskEncoder for MirPureEnc {
                 .sorted()
                 .collect::<Vec<_>>();
             let inputs_expected = inputs.len();
+            let modes_used = std::mem::take(&mut enc.modes_used)
+                .into_iter()
+                .sorted()
+                .collect::<Vec<_>>();
 
             // We wrap the expression with an additional lazy that will perform
             // some sanity checks. These requirements cannot be expressed using
@@ -204,11 +238,18 @@ impl TaskEncoder for MirPureEnc {
                 )
             });
             add_debug_note!(expr.debug_info, "Inner expr: {}", expr_inner.debug_info);
-            Ok((inputs, expr))
+            Ok((inputs, expr, modes_used))
         })?;
         tracing::debug!("finished {def_id:?}");
 
-        Ok(((), MirPureEncOutput { inputs, expr }))
+        Ok((
+            (),
+            MirPureEncOutput {
+                inputs,
+                expr,
+                modes_used,
+            },
+        ))
     }
 }
 
@@ -277,6 +318,7 @@ struct Enc<'vir: 'enc, 'enc> {
     vcx: &'vir vir::VirCtxt<'vir>,
     encoding_depth: usize,
     def_id: DefId,
+    kind: PureKind,
     context: GParams<'vir>,
     body: &'enc mir::Body<'vir>,
     rev_doms: rev_doms::ReverseDominators,
@@ -293,6 +335,12 @@ struct Enc<'vir: 'enc, 'enc> {
     rel1_mode: bool,
     before_expiry_mode: bool,
     impure_context: bool,
+    /// Snapshots that replace the current version of a local, while a spec
+    /// closure's environment is rebuilt in another mode (see
+    /// `encode_closure_env_in_mode`).
+    local_overrides: FxHashMap<mir::Local, ExprRet<'vir>>,
+    /// See `MirPureEncOutput::modes_used`.
+    modes_used: FxHashSet<StateMode>,
 }
 
 struct EncodedPlace<'vir> {
@@ -380,6 +428,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             vcx,
             encoding_depth,
             def_id,
+            kind,
             context: gargs.context(),
             body,
             rev_doms,
@@ -404,6 +453,8 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     ..
                 } | PureKind::SpecBlock(..)
             ),
+            local_overrides: Default::default(),
+            modes_used: Default::default(),
         }
     }
 
@@ -1248,6 +1299,156 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         self.old_mode || self.rel0_mode || self.rel1_mode || self.before_expiry_mode
     }
 
+    fn mode_flag(&mut self, mode: StateMode) -> &mut bool {
+        match mode {
+            StateMode::Old => &mut self.old_mode,
+            StateMode::BeforeExpiry => &mut self.before_expiry_mode,
+            StateMode::Rel0 => &mut self.rel0_mode,
+            StateMode::Rel1 => &mut self.rel1_mode,
+        }
+    }
+
+    /// The one mode that is active. A spec closure's environment is only
+    /// built per single mode, so nesting modes around a closure's captures is
+    /// not supported.
+    fn single_active_mode(&self) -> EncodeResult<'vir, StateMode, MirPureEnc> {
+        let active = [
+            (StateMode::Old, self.old_mode),
+            (StateMode::BeforeExpiry, self.before_expiry_mode),
+            (StateMode::Rel0, self.rel0_mode),
+            (StateMode::Rel1, self.rel1_mode),
+        ]
+        .into_iter()
+        .filter_map(|(mode, set)| set.then_some(mode))
+        .collect::<Vec<_>>();
+        match active[..] {
+            [mode] => Ok(mode),
+            _ => Err(self.unsupported_rvalue(
+                "nested `old`/`before_expiry`/`rel` around a quantifier's captures".to_string(),
+                self.current_span(),
+            )),
+        }
+    }
+
+    /// The right-hand side of the only assignment to `local` in the body, if
+    /// `local` is a temporary assigned exactly once (as spec closures and
+    /// their captures are in the unoptimised MIR of a specification).
+    fn unique_def(
+        body: &'enc mir::Body<'vir>,
+        local: mir::Local,
+    ) -> Option<&'enc mir::Rvalue<'vir>> {
+        if body.local_kind(local) != mir::LocalKind::Temp {
+            return None;
+        }
+        let mut defs = body.basic_blocks.iter().flat_map(|data| {
+            let stmt_defs = data.statements.iter().filter_map(|stmt| match &stmt.kind {
+                mir::StatementKind::Assign(box (dest, rvalue)) if dest.local == local => {
+                    Some(dest.as_local().map(|_| rvalue))
+                }
+                _ => None,
+            });
+            let call_def = match &data.terminator().kind {
+                mir::TerminatorKind::Call { destination, .. } if destination.local == local => {
+                    Some(None)
+                }
+                _ => None,
+            };
+            stmt_defs.chain(call_def)
+        });
+        match (defs.next(), defs.next()) {
+            (Some(def), None) => def,
+            _ => None,
+        }
+    }
+
+    /// Encodes the environment of a spec closure as seen in `mode`: the
+    /// reference `closure_op` to the closure, rebuilt from the closure's
+    /// captures re-evaluated with `mode` set. Each capture is a temporary
+    /// assigned a reference to (or the value of) the captured place, such as
+    /// `&(*a)` or `&((*a).0)` for a `&mut` argument `a`; in `mode`, reading
+    /// that place reads the corresponding state.
+    fn encode_closure_env_in_mode(
+        &mut self,
+        name: &str,
+        closure_op: &mir::Operand<'vir>,
+        curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
+        mode: StateMode,
+    ) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
+        let span = self.current_span();
+        let saved_flag = *self.mode_flag(mode);
+        *self.mode_flag(mode) = true;
+        let res = match closure_op.place().and_then(|place| place.as_local()) {
+            Some(local) => self.rebuild_closure_ref(local, curr_ver, span),
+            None => Ok(false),
+        }
+        .and_then(|rebuilt| {
+            if rebuilt {
+                self.encode_operand_snap(closure_op, curr_ver)
+            } else {
+                Err(self.unsupported_rvalue(
+                    format!("`{mode:?}` mode inside the closure of an unexpected `{name}` call"),
+                    span,
+                ))
+            }
+        });
+        *self.mode_flag(mode) = saved_flag;
+        self.local_overrides.clear();
+        res
+    }
+
+    /// Re-encodes `local`, a temporary holding a spec closure or a
+    /// (re)borrow of one (`_5 = &(*_6); _6 = &_7; _7 = {closure} { .. }`),
+    /// together with the closure's captures, and records the results in
+    /// `local_overrides`. Returns whether `local` has that shape.
+    fn rebuild_closure_ref(
+        &mut self,
+        local: mir::Local,
+        curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
+        span: Span,
+    ) -> EncodeResult<'vir, bool, MirPureEnc> {
+        let body = self.body;
+        let Some(rvalue) = Self::unique_def(body, local) else {
+            return Ok(false);
+        };
+        match rvalue {
+            mir::Rvalue::Aggregate(box mir::AggregateKind::Closure(..), ops) => {
+                for op in ops {
+                    // A user variable captured by value keeps its value: like
+                    // outside a closure, the mode only affects the arguments.
+                    let Some(capture) = op
+                        .place()
+                        .and_then(|place| place.as_local())
+                        .filter(|capture| !body.local_decls[*capture].is_user_variable())
+                    else {
+                        continue;
+                    };
+                    if let Some(rvalue @ (mir::Rvalue::Ref(..) | mir::Rvalue::Use(..))) =
+                        Self::unique_def(body, capture)
+                    {
+                        let expr = self.encode_rvalue(curr_ver, rvalue, span)?;
+                        self.local_overrides.insert(capture, expr);
+                    }
+                }
+            }
+            mir::Rvalue::Ref(_, _, place)
+            | mir::Rvalue::Use(mir::Operand::Copy(place) | mir::Operand::Move(place), _) => {
+                let rebuilt = match place.projection[..] {
+                    [] | [mir::ProjectionElem::Deref] => {
+                        self.rebuild_closure_ref(place.local, curr_ver, span)?
+                    }
+                    _ => false,
+                };
+                if !rebuilt {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+        let expr = self.encode_rvalue(curr_ver, rvalue, span)?;
+        self.local_overrides.insert(local, expr);
+        Ok(true)
+    }
+
     fn encode_place_with_ref(
         &mut self,
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
@@ -1260,12 +1461,32 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
 
         let mut place_ty = mir::PlaceTy::from_ty(self.body.local_decls[place.local].ty);
 
-        let should_wrap = self.in_mode() && {
+        // The captures of a spec closure, read in a mode: they come from the
+        // environment the parent built in that mode, which needs no further
+        // wrapping.
+        let env_mode =
+            if self.kind == PureKind::Closure && place.local == CLOSURE_SELF && self.in_mode() {
+                Some(self.single_active_mode()?)
+            } else {
+                None
+            };
+
+        let should_wrap = env_mode.is_none() && self.in_mode() && {
             let local_kind = self.body.local_kind(place.local);
             local_kind == mir::LocalKind::Arg || local_kind == mir::LocalKind::ReturnPointer
         };
 
-        let expr = if should_wrap {
+        let expr = if let Some(expr) = self.local_overrides.get(&place.local) {
+            *expr
+        } else if let Some(mode) = env_mode {
+            self.modes_used.insert(mode);
+            let env_local = mode.env_local();
+            self.vcx.mk_lazy_expr(
+                vir::vir_format!(self.vcx, "closure env in {mode:?}"),
+                self.get_ty_for_local(place.local),
+                Box::new(move |_vcx, lctx: ExprInput<'vir>| lctx.1[&env_local].kind),
+            )
+        } else if should_wrap {
             self.vcx.mk_lazy_expr(
                 vir::vir_format!(self.vcx, "wrapped in {:?}", place.local),
                 self.get_ty_for_local(place.local),
@@ -1330,7 +1551,8 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         &mut self,
         name: &str,
         closure_ty: ty::Ty<'vir>,
-        closure_snap: ExprRet<'vir>,
+        closure_op: &mir::Operand<'vir>,
+        curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
     ) -> EncodeResult<'vir, SpecClosure<'vir>, MirPureEnc> {
         let (qvar_tys, cl_kind, cl_def_id) = match closure_ty.kind() {
             TyKind::Closure(cl_def_id, cl_args) => (
@@ -1360,46 +1582,46 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 .collect::<Vec<_>>(),
         );
 
-        let mut reify_args = FxHashMap::default();
-        // TODO: big hack!
-        //   the problem is that we expect this to
-        //   be a simple Expr, but `encode_operand`
-        //   returns an ExprRet; do we need ExprRet
-        //   to be piped throughout this encoder?
-        //   alternatively, can we have an "unlift"
-        //   operation, which will work like reify
-        //   but panicking on a Lazy(..)?
-        let closure_ref = unsafe {
-            std::mem::transmute::<ExprRet<'_>, vir::ExprGen<'_, (), !, vir::Snap>>(closure_snap)
-        };
-        // The arguments to the closure are the closure itself and the qvars.
-        reify_args.insert(1usize.into(), closure_ref);
-        reify_args.extend(
-            qvars
-                .iter()
-                .enumerate()
-                .map(|(idx, qvar)| ((idx + 2).into(), self.vcx.mk_local_ex(qvar))),
-        );
-
         // TODO: recursively invoke MirPure encoder to encode
         // the body of the closure; pass the closure as the
         // variable to use, then closure access = tuple access
         // (then hope to optimise this away later ...?)
         use vir::Reify;
-        let body = self
-            .deps
-            .require_dep::<MirPureEnc>(MirPureEncTask {
-                encoding_depth: self.encoding_depth + 1,
-                kind: PureKind::Closure,
-                parent_def_id: cl_def_id,
-                gargs: GParams::from(cl_def_id).identity_args(),
-            })?
-            .expr;
-        let reify_args = self.vcx.alloc(reify_args);
+        let body = self.deps.require_dep::<MirPureEnc>(MirPureEncTask {
+            encoding_depth: self.encoding_depth + 1,
+            kind: PureKind::Closure,
+            parent_def_id: cl_def_id,
+            gargs: GParams::from(cl_def_id).identity_args(),
+        })?;
+
+        // The first argument to the closure is the closure itself, followed
+        // by its environment in each mode the body reads its captures in.
+        let mut closure_args = vec![(
+            CLOSURE_SELF,
+            self.encode_operand_snap(closure_op, curr_ver)?,
+        )];
+        for &mode in &body.modes_used {
+            let env = self.encode_closure_env_in_mode(name, closure_op, curr_ver, mode)?;
+            closure_args.push((mode.env_local(), env));
+        }
+        let body = body.expr;
         let body = self.vcx.mk_lazy_expr(
             vir::vir_format!(self.vcx, "spec closure body ({name})"),
             body.ty(),
             Box::new(move |vcx, lctx: ExprInput<'vir>| {
+                // The closure's arguments are expressions of this body, so
+                // they are reified here first; then the qvars.
+                let mut reify_args = closure_args
+                    .iter()
+                    .map(|(local, arg)| (*local, arg.reify(vcx, lctx)))
+                    .collect::<FxHashMap<_, _>>();
+                reify_args.extend(
+                    qvars
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, qvar)| ((idx + 2).into(), vcx.mk_local_ex(qvar))),
+                );
+                let reify_args = vcx.alloc(reify_args);
                 body.reify(vcx, (cl_def_id, reify_args, lctx.2)).kind
             }),
         );
@@ -1422,22 +1644,22 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             SpecBuiltin::Forall | SpecBuiltin::Exists => {
                 assert_eq!(arg_tys.len(), 3);
 
-                let encoded_args = args
-                    .iter()
-                    .map(|oper| self.encode_operand_snap(&oper.node, curr_ver))
-                    .collect::<Result<Vec<_>, _>>()?;
                 // TODO: for now, let's expect this to give us these two:
                 //   - expression for the triggers
                 //   - expression for the body
-                assert_eq!(encoded_args.len(), 2);
+                assert_eq!(args.len(), 2);
 
                 let name = if builtin == SpecBuiltin::Forall {
                     "forall"
                 } else {
                     "exists"
                 };
-                let (qvars, body) =
-                    self.encode_spec_closure(name, arg_tys[2].expect_ty(), encoded_args[1])?;
+                let (qvars, body) = self.encode_spec_closure(
+                    name,
+                    arg_tys[2].expect_ty(),
+                    &args[1].node,
+                    curr_ver,
+                )?;
                 // TODO: triggers
                 let res = if builtin == SpecBuiltin::Forall {
                     self.vcx.mk_forall_expr(qvars, &[], body)
@@ -1449,16 +1671,13 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             SpecBuiltin::SpecBlock => {
                 assert_eq!(arg_tys.len(), 2);
 
-                let encoded_args = args
-                    .iter()
-                    .map(|oper| self.encode_operand_snap(&oper.node, curr_ver))
-                    .collect::<Result<Vec<_>, _>>()?;
-                assert_eq!(encoded_args.len(), 1);
+                assert_eq!(args.len(), 1);
 
                 let (qvars, body) = self.encode_spec_closure(
                     "spec_block",
                     arg_tys[1].expect_ty(),
-                    encoded_args[0],
+                    &args[0].node,
+                    curr_ver,
                 )?;
                 assert!(qvars.is_empty(), "`spec_block` closures take no arguments");
                 mk_bool(body)
